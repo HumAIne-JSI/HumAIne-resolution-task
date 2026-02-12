@@ -29,6 +29,9 @@ import re
 import pickle
 import datetime
 import logging
+import sqlite3
+import traceback
+from typing import Optional, Dict, List, Tuple
 
 # Load environment variables from .env file if it exists
 try:
@@ -74,18 +77,413 @@ DEFAULT_KB_PATH = os.getenv("KNOWLEDGE_BASE_PATH", "tickets_large_first_reply_la
 
 # LLM configuration
 LLM_MODEL = "gpt-3.5-turbo"
-LLM_MAX_TOKENS = 800
+LLM_MAX_TOKENS = 400  # Reduced from 800 for speed
 LLM_TEMPERATURE = 0.2
+
+# Feedback/reranking configuration (Laplace smoothing + stronger lifts)
+FEEDBACK_DB_PATH = os.getenv("FEEDBACK_DB_PATH", "feedback_refid.db")
+FEEDBACK_ENABLED = bool(os.getenv("FEEDBACK_ENABLED", "True").lower() in ['true', '1', 'yes'])  # TOGGLE for A/B testing
+FEEDBACK_ALPHA = float(os.getenv("FEEDBACK_ALPHA", "1.0"))  # Laplace alpha
+FEEDBACK_BETA = float(os.getenv("FEEDBACK_BETA", "1.0"))    # Laplace beta
+# Require more total votes before feedback reaches full strength.
+# OPTIMIZED - Lowered from 10 to 5 for better coverage
+FEEDBACK_MIN_COUNT = int(os.getenv("FEEDBACK_MIN_COUNT", "2"))  # Lowered to increase % of tickets affected
+# Slightly more balanced weights across scopes so no single scope dominates.
+# Rebalanced feedback weights:
+# Global feedback can become a "popularity prior" and hurt on strong retrieval.
+# Prefer class/team-scoped signal when available; keep global as a small backstop.
+FEEDBACK_W_GLOBAL = float(os.getenv("FEEDBACK_W_GLOBAL", "0.10"))
+FEEDBACK_W_CLASS = float(os.getenv("FEEDBACK_W_CLASS", "0.55"))
+FEEDBACK_W_TEAM = float(os.getenv("FEEDBACK_W_TEAM", "0.35"))
+# Cap how much feedback can move the score; keep it as a bias, not a full override.
+# FIXED: Lowered from 1.5 to 0.5 - feedback was over-valuing popular tickets
+FEEDBACK_TOTAL_LIFT_CAP = float(os.getenv("FEEDBACK_TOTAL_LIFT_CAP", "0.5"))  # FIXED: Was 1.5, causing popular tickets to overtake perfect FAISS matches
+FEEDBACK_LIFT_MULT = float(os.getenv("FEEDBACK_LIFT_MULT", "1.5"))  # FIXED: Was 4.0, reduced to prevent demoting high FAISS scores
+FEEDBACK_POS_BOOST = float(os.getenv("FEEDBACK_POS_BOOST", "0.10"))  # Reduced from 0.10
+FEEDBACK_LOG_LEVEL = os.getenv("FEEDBACK_LOG_LEVEL", "INFO").upper()
+FEEDBACK_LOG_TOPN = int(os.getenv("FEEDBACK_LOG_TOPN", "5"))
+# Pre-FAISS feedback boost: DISABLED - was breaking retrieval with insufficient data
+FEEDBACK_PRE_SEARCH = bool(os.getenv("FEEDBACK_PRE_SEARCH", "false").lower() in ['true', '1', 'yes'])
+
+# ============================================================================
+# INJECTION CONTROL (NEW)
+# ============================================================================
+# Allow disabling feedback injection while keeping re-ranking
+# Set to 0 to test if injection is hurting performance
+FEEDBACK_MAX_INJECT = int(os.getenv("FEEDBACK_MAX_INJECT", "0"))  # 0 = no injection, only re-rank
+
+# ============================================================================
+# CONFIDENCE-BASED GATING (CORRECTED 2026-01-30 - LOGIC INVERTED)
+# ============================================================================
+
+#
+# IMPLEMENTATION:
+# - Gate OFF AL when baseline cosine < 0.60 (weak retrieval, 59% of tickets)
+# - Activate AL when baseline cosine ≥ 0.60 (strong retrieval, 41% of tickets)
+# - Expected improvement: +1.5% over baseline (vs previous -1.6%)
+#
+FEEDBACK_CONFIDENCE_GATE = bool(os.getenv("FEEDBACK_CONFIDENCE_GATE", "true").lower() in ['true', '1', 'yes'])
+FEEDBACK_CONFIDENCE_THRESHOLD = float(os.getenv("FEEDBACK_CONFIDENCE_THRESHOLD", "0.60"))  # CORRECTED: Now gates OFF below threshold
+
+# ============================================================================
+# RELEVANCE-FILTERED FEEDBACK (NEW)
+# ============================================================================
+# To prevent "globally popular but irrelevant" items from degrading AL performance,
+# we now filter feedback items by semantic similarity to the current query.
+# Only items with cosine(query, feedback_item) >= threshold are injected/boosted.
+FEEDBACK_RELEVANCE_THRESHOLD = float(os.getenv("FEEDBACK_RELEVANCE_THRESHOLD", "0.75"))
+# Recommended values:
+#   0.65 (default): Permissive - allows moderately related items
+#   0.70-0.75: Balanced - good signal-to-noise ratio
+#   0.80+: Strict - only very similar items
+
+# ============================================================================
+# TIERED ACTIVE LEARNING
+# ============================================================================
+# Tiered Active Learning (AL) policy driven by baseline retrieval quality proxy.
+# Goal: avoid harming already-strong retrieval, add small AL influence for mid retrieval,
+# and allow full AL for weak retrieval.
+AL_TIER_ENABLED = bool(os.getenv("AL_TIER_ENABLED", "true").lower() in ['true', '1', 'yes'])
+
+# Thresholds operate on a retrieval-quality proxy in [0, 1] derived from FAISS inner-product scores.
+# (For normalized embeddings, IP ~= cosine similarity.)
+# Default tiers tuned from our analysis:
+# - AL tends to help when baseline retrieval is weak.
+# - AL can hurt when baseline retrieval is already very strong.
+# So we only fully disable AL at extremely high similarity, and we
+# enable full-strength AL earlier for weak retrieval.
+AL_TIER_STRONG_THRESHOLD = float(os.getenv("AL_TIER_STRONG_THRESHOLD", "0.93"))
+AL_TIER_WEAK_THRESHOLD = float(os.getenv("AL_TIER_WEAK_THRESHOLD", "0.82"))
+
+# How many top feedback items to inject per tier.
+AL_TIER_INJECT_STRONG = int(os.getenv("AL_TIER_INJECT_STRONG", "0"))
+AL_TIER_INJECT_MID = int(os.getenv("AL_TIER_INJECT_MID", "3"))
+AL_TIER_INJECT_WEAK = int(os.getenv("AL_TIER_INJECT_WEAK", "8"))
+
+# Scale how strongly feedback can move scores per tier (multiplies computed lift and pos_boost).
+AL_TIER_LIFT_SCALE_STRONG = float(os.getenv("AL_TIER_LIFT_SCALE_STRONG", "0.0"))
+AL_TIER_LIFT_SCALE_MID = float(os.getenv("AL_TIER_LIFT_SCALE_MID", "0.35"))
+AL_TIER_LIFT_SCALE_WEAK = float(os.getenv("AL_TIER_LIFT_SCALE_WEAK", "1.0"))
+
+
+def _al_tier_for_quality(q: float | None) -> tuple[str, float, int]:
+    """Return (tier_name, lift_scale, inject_top_n) for a given retrieval quality proxy."""
+    # Default to "mid" if missing.
+    if q is None or not isinstance(q, (int, float)):
+        return "mid", AL_TIER_LIFT_SCALE_MID, AL_TIER_INJECT_MID
+    if q >= AL_TIER_STRONG_THRESHOLD:
+        return "strong", AL_TIER_LIFT_SCALE_STRONG, AL_TIER_INJECT_STRONG
+    if q < AL_TIER_WEAK_THRESHOLD:
+        return "weak", AL_TIER_LIFT_SCALE_WEAK, AL_TIER_INJECT_WEAK
+    return "mid", AL_TIER_LIFT_SCALE_MID, AL_TIER_INJECT_MID
+
+# Dedicated feedback logger for clearer diagnostics
+feedback_logger = logging.getLogger(__name__ + ".feedback")
+try:
+    feedback_logger.setLevel(getattr(logging, FEEDBACK_LOG_LEVEL, logging.INFO))
+except Exception:
+    feedback_logger.setLevel(logging.INFO)
+
+def _feedback_init_db(db_path: str = FEEDBACK_DB_PATH) -> None:
+    """Create feedback tables if they do not exist."""
+    feedback_logger.debug(f"Initializing feedback DB at: {db_path}")
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback_raw (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                query_id TEXT,
+                retrieved_id TEXT,
+                predicted_class TEXT,
+                predicted_team TEXT,
+                label INTEGER, -- +1 / -1
+                user_id TEXT,
+                ts DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback_agg (
+                retrieved_id TEXT,
+                scope_key TEXT,
+                pos INTEGER,
+                neg INTEGER,
+                last_ts DATETIME,
+                PRIMARY KEY (retrieved_id, scope_key)
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def record_feedback(
+    query_id: str,
+    retrieved_id: str,
+    label: int,
+    predicted_class: Optional[str] = None,
+    predicted_team: Optional[str] = None,
+    user_id: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> None:
+    """Persist a single thumbs up/down event and update aggregates.
+
+    Note: LLM-judge derived feedback is already made softer/conservative at the
+    source (via thresholds and a neutral band in judge_service.map_scores_to_votes),
+    and overall influence is further limited by FEEDBACK_TOTAL_LIFT_CAP and
+    FEEDBACK_MIN_COUNT. Human feedback is treated the same way here but will
+    typically be much sparser and therefore carry relatively more signal.
+    """
+    # Resolve DB path at call time to honor current environment
+    db_path = db_path or os.getenv("FEEDBACK_DB_PATH", FEEDBACK_DB_PATH)
+    _feedback_init_db(db_path)
+    feedback_logger.info(
+        f"Feedback received: query_id={query_id} retrieved_id={retrieved_id} label={label} "
+        f"class={predicted_class} team={predicted_team} user={user_id}"
+    )
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO feedback_raw(query_id, retrieved_id, predicted_class, predicted_team, label, user_id) VALUES (?,?,?,?,?,?)",
+            (query_id, retrieved_id, predicted_class, predicted_team, int(label), user_id),
+        )
+        def _update(scope_key: str) -> None:
+            cur.execute(
+                "SELECT pos,neg FROM feedback_agg WHERE retrieved_id=? AND scope_key=?",
+                (retrieved_id, scope_key),
+            )
+            row = cur.fetchone()
+            pos, neg = (row or (0, 0))
+            before = (pos, neg)
+            if label > 0:
+                pos += 1
+            else:
+                neg += 1
+            cur.execute(
+                "REPLACE INTO feedback_agg(retrieved_id, scope_key, pos, neg, last_ts) VALUES (?,?,?,?,CURRENT_TIMESTAMP)",
+                (retrieved_id, scope_key, pos, neg),
+            )
+            feedback_logger.debug(
+                f"Updated agg for scope={scope_key} id={retrieved_id}: {before} -> (pos={pos}, neg={neg})"
+            )
+        # Update aggregates by scope.
+        # We include class/team scopes to avoid global popularity overriding relevance,
+        # but keep global as a small backstop.
+        _update("global")
+        if predicted_class:
+            _update(f"class:{predicted_class}")
+        if predicted_team:
+            _update(f"team:{predicted_team}")
+        conn.commit()
+    finally:
+        conn.close()
+
+def _get_top_feedback_items(
+    predicted_class: Optional[str],
+    predicted_team: Optional[str],
+    top_n: int = 10,
+    db_path: Optional[str] = None,
+    query_embedding: Optional[np.ndarray] = None,
+    knowledge_base: Optional[pd.DataFrame] = None,
+    embeddings: Optional[np.ndarray] = None,
+    relevance_threshold: float = 0.65,
+) -> List[Tuple[str, float]]:
+    """Get top-rated items by feedback score, FILTERED by semantic relevance to query.
+    
+    NEW: Now requires query_embedding + KB to compute relevance of feedback items
+    to current query. Only returns items semantically similar to query (cosine > threshold).
+    
+    This prevents "globally popular but irrelevant" items from being injected.
+    
+    Args:
+        query_embedding: Current query embedding (for relevance filtering)
+        knowledge_base: DataFrame with ticket data (for lookup)
+        embeddings: All KB embeddings (for relevance computation)
+        relevance_threshold: Min cosine similarity to include item (default 0.65)
+    
+    Returns list of (retrieved_id, feedback_score) tuples for items with positive feedback
+    that are semantically relevant to the query.
+    """
+    db_path = db_path or os.getenv("FEEDBACK_DB_PATH", FEEDBACK_DB_PATH)
+    _feedback_init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        # CRITICAL FIX: Get ALL feedback from global scope only
+        # Do NOT filter by class/team - relevance filtering will handle that
+        # This allows feedback from any ticket type to be considered if semantically relevant
+        
+        cur.execute(
+            "SELECT retrieved_id, pos, neg FROM feedback_agg WHERE scope_key='global' AND pos > 0 ORDER BY (pos - neg) DESC LIMIT ?",
+            (top_n * 10,)  # Get many candidates for relevance filtering to choose from
+        )
+        
+        item_scores = {}
+        for retrieved_id, pos, neg in cur.fetchall():
+            # Simple positive ratio as score
+            item_scores[retrieved_id] = (pos - neg) / max(1, pos + neg)
+        
+        # NEW: Filter by semantic relevance to query
+        if query_embedding is not None and knowledge_base is not None and embeddings is not None:
+            relevance_filtered = []
+            for retrieved_id, score in item_scores.items():
+                try:
+                    # Find item in KB — try Ref first, then Ticket_Reference, then index
+                    mask = None
+                    if 'Ref' in knowledge_base.columns:
+                        mask = knowledge_base['Ref'].astype(str) == str(retrieved_id)
+                    if mask is None or not mask.any():
+                        if 'Ticket_Reference' in knowledge_base.columns:
+                            mask = knowledge_base['Ticket_Reference'] == retrieved_id
+                    if mask is None or not mask.any():
+                        mask = knowledge_base.index.astype(str) == str(retrieved_id)
+                    
+                    if mask.any():
+                        kb_idx = knowledge_base[mask].index[0]
+                        item_embedding = embeddings[kb_idx:kb_idx+1]
+                        
+                        # Compute cosine similarity
+                        similarity = float(np.dot(query_embedding.flatten(), item_embedding.flatten()) / 
+                                         (np.linalg.norm(query_embedding) * np.linalg.norm(item_embedding)))
+                        
+                        if similarity >= relevance_threshold:
+                            relevance_filtered.append((retrieved_id, score, similarity))
+                            feedback_logger.debug(
+                                f"Feedback item {retrieved_id}: score={score:.3f}, relevance={similarity:.3f} ✓"
+                            )
+                        else:
+                            feedback_logger.debug(
+                                f"Feedback item {retrieved_id}: score={score:.3f}, relevance={similarity:.3f} ✗ (filtered)"
+                            )
+                except Exception as e:
+                    feedback_logger.debug(f"Failed relevance check for {retrieved_id}: {e}")
+            
+            # Sort by feedback score (relevance already filtered)
+            relevance_filtered.sort(key=lambda x: x[1], reverse=True)
+            result = [(item_id, score) for item_id, score, _ in relevance_filtered[:top_n]]
+            
+            if result:
+                feedback_logger.info(
+                    f"Relevance filtering: {len(item_scores)} candidates → {len(result)} relevant "
+                    f"(threshold={relevance_threshold:.2f})"
+                )
+            return result
+        else:
+            # Fallback: no relevance filtering (old behavior)
+            sorted_items = sorted(item_scores.items(), key=lambda x: x[1], reverse=True)
+            return sorted_items[:top_n]
+    finally:
+        conn.close()
+
+def _feedback_lift_for(
+    retrieved_id: str,
+    predicted_class: Optional[str],
+    predicted_team: Optional[str],
+    db_path: Optional[str] = None,
+    query_embedding: Optional[np.ndarray] = None,
+    knowledge_base: Optional[pd.DataFrame] = None,
+    embeddings: Optional[np.ndarray] = None,
+    relevance_threshold: float = 0.65,
+) -> float:
+    """Compute feedback lift ONLY if ticket is semantically relevant to query.
+    
+    CRITICAL FIX: Now requires query context to check relevance.
+    If the feedback ticket isn't semantically similar to the current query (cosine < threshold),
+    return 0.0 lift (ignore its votes).
+    
+    This prevents popular-but-irrelevant tickets from being boosted.
+    """
+    # Quick exit if feedback is disabled (for baseline comparisons)
+    if not FEEDBACK_ENABLED:
+        return 0.0
+    
+    # CRITICAL: Check semantic relevance FIRST before using votes
+    if query_embedding is not None and knowledge_base is not None and embeddings is not None:
+        try:
+            # Find ticket in KB — try Ref first, then Ticket_Reference, then index
+            mask = None
+            if 'Ref' in knowledge_base.columns:
+                mask = knowledge_base['Ref'].astype(str) == str(retrieved_id)
+            if mask is None or not mask.any():
+                if 'Ticket_Reference' in knowledge_base.columns:
+                    mask = knowledge_base['Ticket_Reference'] == retrieved_id
+            if mask is None or not mask.any():
+                mask = knowledge_base.index.astype(str) == str(retrieved_id)
+            
+            if mask.any():
+                kb_idx = knowledge_base[mask].index[0]
+                item_embedding = embeddings[kb_idx:kb_idx+1]
+                
+                # Compute cosine similarity to query
+                similarity = float(np.dot(query_embedding.flatten(), item_embedding.flatten()) / 
+                                 (np.linalg.norm(query_embedding) * np.linalg.norm(item_embedding)))
+                
+                # If not relevant, ignore feedback entirely
+                if similarity < relevance_threshold:
+                    feedback_logger.debug(
+                        f"Feedback for {retrieved_id} IGNORED: relevance={similarity:.3f} < threshold={relevance_threshold:.2f}"
+                    )
+                    return 0.0
+                
+                feedback_logger.debug(
+                    f"Feedback for {retrieved_id} APPLIED: relevance={similarity:.3f} >= threshold={relevance_threshold:.2f}"
+                )
+            else:
+                # Ticket not found in KB - can't check relevance, ignore feedback
+                feedback_logger.debug(f"Feedback for {retrieved_id} IGNORED: ticket not found in KB")
+                return 0.0
+                
+        except Exception as e:
+            feedback_logger.debug(f"Failed relevance check for {retrieved_id}: {e}, ignoring feedback")
+            return 0.0
+    else:
+        # No query context provided - can't check relevance, ignore feedback for safety
+        feedback_logger.debug(f"Feedback for {retrieved_id} IGNORED: no query context for relevance check")
+        return 0.0
+    
+    # Passed relevance check - now look up votes
+    db_path = db_path or os.getenv("FEEDBACK_DB_PATH", FEEDBACK_DB_PATH)
+    _feedback_init_db(db_path)
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.cursor()
+        # ONLY use global scope - semantic relevance already verified above
+        cur.execute(
+            "SELECT pos,neg FROM feedback_agg WHERE retrieved_id=? AND scope_key='global'",
+            (retrieved_id,),
+        )
+        row = cur.fetchone()
+        pos, neg = (row or (0, 0))
+        
+        # Bayesian smoothing
+        p = (pos + FEEDBACK_ALPHA) / (pos + neg + FEEDBACK_ALPHA + FEEDBACK_BETA)
+        scale = min(1.0, (pos + neg) / max(1, FEEDBACK_MIN_COUNT))
+        lift = (p - 0.5) * scale * FEEDBACK_LIFT_MULT
+        
+        # Cap individual lift
+        if lift > FEEDBACK_TOTAL_LIFT_CAP:
+            lift = FEEDBACK_TOTAL_LIFT_CAP
+        elif lift < -FEEDBACK_TOTAL_LIFT_CAP:
+            lift = -FEEDBACK_TOTAL_LIFT_CAP
+        
+        feedback_logger.debug(
+            f"Feedback lift for {retrieved_id}: pos={pos} neg={neg} p={p:.4f} scale={scale:.4f} lift={lift:.4f} [RELEVANT]"
+        )
+        return lift
+    finally:
+        conn.close()
 
 # ============================================================================
 # OPENAI CLIENT INITIALIZATION
 # ============================================================================
-
 # OpenAI API configuration - set OPENAI_API_KEY environment variable
 _OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 _OPENAI_CLIENT_MODE = "unavailable"
 _OPENAI_INIT_ERROR = None  # Store initialization error message
-
 # Try to detect and initialize OpenAI client (supports both v0.28 and v1.0+)
 try:
     import openai
@@ -140,6 +538,49 @@ except Exception as init_error:
         return f"[OpenAI client error: {_OPENAI_INIT_ERROR}]"
     
     logger.error(f"OpenAI client initialization error: {init_error}")
+
+# ============================================================================
+# GENERATION CONFIG (env overrides)
+# ============================================================================
+# Goal: allow the API pipeline to match the legacy (no-feedback) generator behavior
+# without importing the old module. Defaults are chosen to be closer to the legacy
+# template-style generation (gpt-4 + larger token budget).
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except Exception:
+        return default
+
+
+def _env_str(name: str, default: str) -> str:
+    val = os.getenv(name)
+    return val.strip() if isinstance(val, str) and val.strip() else default
+
+
+# Model defaults: legacy used gpt-4 for template generation; we expose both paths.
+GEN_MODEL_TEMPLATE = _env_str("GEN_MODEL_TEMPLATE", "gpt-4")
+GEN_MODEL_PERSONAL = _env_str("GEN_MODEL_PERSONAL", "gpt-4")
+GEN_MODEL_SHORT = _env_str("GEN_MODEL_SHORT", "gpt-4")
+GEN_MODEL_STATUS = _env_str("GEN_MODEL_STATUS", "gpt-4")
+
+# Token/temperature defaults tuned to be close to legacy.
+GEN_MAX_TOKENS_TEMPLATE = _env_int("GEN_MAX_TOKENS_TEMPLATE", 800)
+GEN_MAX_TOKENS_PERSONAL = _env_int("GEN_MAX_TOKENS_PERSONAL", 800)
+GEN_MAX_TOKENS_SHORT = _env_int("GEN_MAX_TOKENS_SHORT", 150)
+GEN_MAX_TOKENS_STATUS = _env_int("GEN_MAX_TOKENS_STATUS", 300)
+
+GEN_TEMPERATURE_TEMPLATE = _env_float("GEN_TEMPERATURE_TEMPLATE", 0.2)
+GEN_TEMPERATURE_PERSONAL = _env_float("GEN_TEMPERATURE_PERSONAL", 0.2)
+GEN_TEMPERATURE_SHORT = _env_float("GEN_TEMPERATURE_SHORT", 0.7)
+GEN_TEMPERATURE_STATUS = _env_float("GEN_TEMPERATURE_STATUS", 0.2)
 
 # LAZY LOADING: Initialize model references to None
 # Models will be loaded only when first needed, reducing startup time
@@ -260,7 +701,7 @@ def classify_team_with_distilbert(ticket_text, service_category=None, service_su
         return "(GI-SM) Service Desk", 0.5  # Default fallback
 
 
-# Load the knowledge base (tickets_large_first_reply_label.csv)
+# Load the knowledge base (tickets_large_first_reply_label_copy.csv)
 def load_knowledge_base(file_path):
     df = pd.read_csv(file_path)
     df = df.dropna(subset=['Public_log_anon'])  # Drop rows without public logs
@@ -337,7 +778,7 @@ class RAGSystem:
         self.kb_path = kb_path
 
     def build_index(self, kb_path: str | None = None, kb_mtime: float | None = None):
-        """Build or load cached embeddings + FAISS index.
+        """Build or load cached embeddings + FAISS index. 
 
         Caching strategy:
         - Cache file stored under embeddings_cache/<basename>_<model>_<mtime>.npz
@@ -410,54 +851,383 @@ class RAGSystem:
                     mask = self.knowledge_base['label_auto'] == category
                     self.category_index[category] = self.knowledge_base[mask].index.tolist()
 
-    def retrieve_similar_replies(self, query, top_k=5, predicted_category=None):
-        """Enhanced retrieval with multi-factor scoring and category awareness"""
-        
+    def retrieve_similar_replies(self, query, top_k=5, predicted_category=None, predicted_class: Optional[str] = None, predicted_team: Optional[str] = None):
+        """Enhanced retrieval with multi-factor scoring and feedback-aware re-ranking."""
+        _feedback_init_db()
         # Get larger candidate set for re-ranking
-        search_k = min(top_k * 4, len(self.knowledge_base))
+        search_k = min(max(top_k * 4, top_k), len(self.knowledge_base)) ##### MODIFIED from top_k * 6
+        feedback_logger.debug(
+            f"Retrieval start: top_k={top_k} search_k={search_k} class={predicted_class} team={predicted_team}"
+        )
         
-        # Step 1: Get candidates from FAISS
+        # Step 0: PRE-FAISS FEEDBACK BOOST - adjust query embedding based on positive feedback
         query_embedding = self.sentence_model.encode([query])
+
+        # NOTE: We select a tier after we have baseline FAISS scores.
+        # Pre-search feedback-boost can still be helpful, but we only do it if
+        # feedback is enabled and tiering isn't enabled (tiering uses injection + lift scaling instead).
+        if FEEDBACK_PRE_SEARCH and FEEDBACK_ENABLED and not AL_TIER_ENABLED:
+            top_feedback = _get_top_feedback_items(
+                predicted_class, 
+                predicted_team, 
+                top_n=5,
+                query_embedding=query_embedding,
+                knowledge_base=self.knowledge_base,
+                embeddings=self.embeddings,
+                relevance_threshold=FEEDBACK_RELEVANCE_THRESHOLD,
+            )
+            if top_feedback:
+                feedback_logger.info(f"Pre-FAISS boost: incorporating {len(top_feedback)} top-rated items into query")
+                # Get embeddings of top-rated items and blend with query
+                boost_weight = 0.15  # How much to shift query toward positive examples
+                for item_id, score in top_feedback:
+                    try:
+                        # Find item in knowledge base — try Ref first, then Ticket_Reference, then index
+                        mask = None
+                        if 'Ref' in self.knowledge_base.columns:
+                            mask = self.knowledge_base['Ref'].astype(str) == str(item_id)
+                        if mask is None or not mask.any():
+                            if 'Ticket_Reference' in self.knowledge_base.columns:
+                                mask = self.knowledge_base['Ticket_Reference'] == item_id
+                        if mask is None or not mask.any():
+                            mask = self.knowledge_base.index.astype(str) == item_id
+                        
+                        if mask.any():
+                            kb_idx = self.knowledge_base[mask].index[0]
+                            item_embedding = self.embeddings[kb_idx:kb_idx+1]
+                            # Weighted blend: move query slightly toward this positive example
+                            query_embedding = query_embedding + (boost_weight * score * item_embedding)
+                    except Exception as e:
+                        feedback_logger.debug(f"Failed to boost with item {item_id}: {e}")
+                
+                # Re-normalize after blending
+                faiss.normalize_L2(query_embedding)
+                feedback_logger.debug("Query embedding adjusted with pre-search feedback boost")
+        
+        # Step 1: Get candidates from FAISS (baseline retrieval quality proxy)
         faiss.normalize_L2(query_embedding)
         distances, indices = self.index.search(np.array(query_embedding).astype('float32'), search_k)
+
+        # Compute retrieval-quality proxy from baseline FAISS scores.
+        # For normalized sentence-transformer embeddings, FAISS IndexFlatIP returns inner product ~ cosine.
+        # We use the mean of top_k FAISS scores as a stable proxy.
+        quality_proxy = None
+        try:
+            top_scores = distances[0][: max(1, min(top_k, len(distances[0])))]
+            if len(top_scores) > 0:
+                quality_proxy = float(np.mean(top_scores))
+        except Exception:
+            quality_proxy = None
+
+        # ============================================================================
+        # OPTIMAL CONFIDENCE-BASED GATING: Evidence-Based AL Activation
+        # ============================================================================
+        # Comprehensive manual analysis of 318 tickets across 4 evaluations (2026-01-29)
+        # revealed the OPTIMAL pattern:
+        # 
+        # 🎯 BEST RULE: Use AL ONLY when baseline retrieval is WEAK (judge score ≤ 0.20)
+        # 
+        # Evidence:
+        # - 25 tickets (16.4% usage rate)
+        # - 56% help rate when activated
+        # - +0.9758% average improvement
+        # - Expected gain: +387.8% over current gating!
+        # 
+        # Pattern Discovery:
+        # ✅ When baseline WEAK (judge ≤ 0.20): AL helps 56% of time, improves +0.98%
+        # ❌ When baseline DECENT (judge > 0.20): AL helps 52.5%, but hurts more (-0.12%)
+        # ❌ When baseline STRONG (judge > 0.80): AL helps only 50%, hurts -2.32%
+        # 
+        # Key Insight: AL is RESCUE mechanism for failed baseline retrieval, 
+        # NOT an enhancement for already-working retrieval!
+        feedback_gated = False
+        if FEEDBACK_ENABLED and FEEDBACK_CONFIDENCE_GATE and quality_proxy is not None:
+            max_faiss_score = float(distances[0][0]) if len(distances[0]) > 0 else 0.0
+            
+            # CORRECTED GATING LOGIC (2026-01-30) - INVERTED FROM PREVIOUS VERSION
+            # ======================================================================
+            # CRITICAL DISCOVERY from analysis of 316 tickets:
+            #   Correlation(baseline_cosine, AL_delta) = -0.206 (p=0.0002)
+            # 
+            # THIS MEANS: AL helps MORE when baseline is ALREADY STRONG!
+            # 
+            # Evidence:
+            #   AL HELPS  (27 tickets): Avg baseline cosine = 0.4766 → AL improves +9%
+            #   AL HURTS  (25 tickets): Avg baseline cosine = 0.6733 → AL degrades -13%
+            # 
+            # KEY INSIGHT:
+            # AL is an OPTIMIZER, not a RESCUER
+            # - When baseline is WEAK: Retrieved docs are poor → AL reranking of garbage = garbage
+            # - When baseline is STRONG: Retrieved docs are good → AL optimizes ranking = better results
+            # 
+            # THEREFORE: Gate OFF weak baselines, ACTIVATE strong baselines
+            # (This is the OPPOSITE of our previous hypothesis)
+            
+            STRONG_BASELINE_THRESHOLD = 0.60  # Gate OFF if cosine < 0.60 (weak baseline)
+            
+            if max_faiss_score < STRONG_BASELINE_THRESHOLD:
+                # Baseline retrieval is WEAK - AL cannot rescue poor retrieval!
+                feedback_gated = True
+                feedback_logger.info(
+                    f"🚫 CORRECTED GATE: Baseline retrieval is WEAK ({max_faiss_score:.4f} < {STRONG_BASELINE_THRESHOLD:.2f}) - "
+                    f"AL cannot rescue poor retrieval. Using baseline only."
+                )
+            else:
+                # Baseline retrieval is STRONG - AL can optimize ranking!
+                feedback_logger.info(
+                    f"✅ CORRECTED GATE: Baseline retrieval is STRONG ({max_faiss_score:.4f} ≥ {STRONG_BASELINE_THRESHOLD:.2f}) - "
+                    f"Activating AL to optimize ranking (expected +1.5% improvement based on n=316 analysis)"
+                )
         
+        # If gated, return baseline results immediately
+        if feedback_gated:
+            feedback_logger.info(
+                f"🚫 AL GATED: Returning pure FAISS baseline results"
+            )
+            # Return baseline results immediately - no re-ranking, no injection
+            candidates = self.knowledge_base.iloc[indices[0][:top_k]].copy()
+            candidates['faiss_score'] = distances[0][:top_k]
+            # Use Ref as stable retrieved_id (survives KB sub-sampling / index resets)
+            if 'Ref' in candidates.columns:
+                ref_col = candidates['Ref']
+                fallback_ids = candidates.index.astype(str)
+                candidates['retrieved_id'] = ref_col.where(ref_col.notna(), fallback_ids).astype(str)
+            elif 'Ticket_Reference' in candidates.columns:
+                tr = candidates['Ticket_Reference']
+                fallback_ids = candidates.index.astype(str)
+                candidates['retrieved_id'] = tr.where(tr.notna(), fallback_ids).astype(str)
+            else:
+                candidates['retrieved_id'] = candidates.index.astype(str)
+            
+            # Add metadata for tracking
+            candidates['enhanced_score'] = candidates['faiss_score']
+            candidates['feedback_lift'] = 0.0
+            candidates['confidence_gated'] = True
+            
+            return candidates[['retrieved_id', 'first_reply', 'Title_anon', 'Description_anon', 
+                              'enhanced_score', 'feedback_lift', 'confidence_gated']]
+
+        tier_name, tier_lift_scale, tier_inject_n = ("mid", 1.0, 10)
+        if AL_TIER_ENABLED:
+            tier_name, tier_lift_scale, tier_inject_n = _al_tier_for_quality(quality_proxy)
+            if feedback_logger.isEnabledFor(logging.INFO):
+                feedback_logger.info(
+                    f"AL tier={tier_name} quality_proxy={quality_proxy} lift_scale={tier_lift_scale} inject_top_n={tier_inject_n}"
+                )
         candidates = self.knowledge_base.iloc[indices[0]].copy()
         candidates['faiss_score'] = distances[0]
+        # Use Ref as stable retrieved_id (survives KB sub-sampling / index resets).
+        # Prefer Ref > Ticket_Reference > DataFrame index.
+        if 'Ref' in candidates.columns:
+            ref_col = candidates['Ref']
+            fallback_ids = candidates.index.astype(str)
+            candidates['retrieved_id'] = ref_col.where(ref_col.notna(), fallback_ids).astype(str)
+        elif 'Ticket_Reference' in candidates.columns:
+            tr = candidates['Ticket_Reference']
+            fallback_ids = candidates.index.astype(str)
+            candidates['retrieved_id'] = tr.where(tr.notna(), fallback_ids).astype(str)
+        else:
+            candidates['retrieved_id'] = candidates.index.astype(str)
+        # Optional: warn if duplicates still exist (can indicate KB issues)
+        try:
+            if feedback_logger.isEnabledFor(logging.WARNING):
+                dup_ids = candidates['retrieved_id'][candidates['retrieved_id'].duplicated()].unique()
+                if len(dup_ids) > 0:
+                    feedback_logger.warning(f"Duplicate retrieved_ids detected in candidates: {list(dup_ids)[:10]}")
+        except Exception:
+            # Logging issues should never break retrieval
+            pass
+        
+        # Inject top feedback items into candidate set (tiered strength)
+        # - strong tier: inject 0
+        # - mid tier: inject a few
+        # - weak tier: inject more
+        inject_n = 10
+        if AL_TIER_ENABLED:
+            inject_n = max(0, int(tier_inject_n))
+        
+        # Apply global injection limit (allows disabling injection via env var)
+        inject_n = min(inject_n, FEEDBACK_MAX_INJECT)
+
+        if FEEDBACK_ENABLED and inject_n > 0:
+            top_feedback = _get_top_feedback_items(
+                predicted_class, 
+                predicted_team, 
+                top_n=inject_n,
+                query_embedding=query_embedding,
+                knowledge_base=self.knowledge_base,
+                embeddings=self.embeddings,
+                relevance_threshold=FEEDBACK_RELEVANCE_THRESHOLD,
+            )
+            if top_feedback:
+                injected_count = 0
+                for item_id, score in top_feedback:
+                    # Check if already in candidates
+                    if item_id not in candidates['retrieved_id'].values:
+                        try:
+                            # Find item in knowledge base — try Ref first, then Ticket_Reference, then index
+                            mask = None
+                            if 'Ref' in self.knowledge_base.columns:
+                                mask = self.knowledge_base['Ref'].astype(str) == str(item_id)
+                            if mask is None or not mask.any():
+                                if 'Ticket_Reference' in self.knowledge_base.columns:
+                                    mask = self.knowledge_base['Ticket_Reference'] == item_id
+                            if mask is None or not mask.any():
+                                mask = self.knowledge_base.index.astype(str) == item_id
+                            
+                            if mask.any():
+                                kb_idx = self.knowledge_base[mask].index[0]
+                                # Add to candidates with synthetic FAISS score (will be re-ranked by enhanced scoring)
+                                new_row = self.knowledge_base.loc[kb_idx].copy()
+                                new_row['faiss_score'] = 0.5  # Neutral FAISS score
+                                new_row['retrieved_id'] = item_id
+                                candidates = pd.concat([candidates, pd.DataFrame([new_row])], ignore_index=True)
+                                injected_count += 1
+                        except Exception as e:
+                            feedback_logger.debug(f"Failed to inject feedback item {item_id}: {e}")
+                
+                if injected_count > 0:
+                    feedback_logger.info(f"Injected {injected_count} high-feedback items into candidate set")
         
         # Step 2: Calculate enhanced scores
         enhanced_scores = []
+        lifts = []
         for idx, row in candidates.iterrows():
-            score = self._calculate_enhanced_score(query, row, predicted_category, distances[0][candidates.index.get_loc(idx)])
-            enhanced_scores.append(score)
-        
+            # Use the row's own faiss_score (robust even after candidate injection and index resets)
+            faiss_score = float(row.get('faiss_score', 0.0) or 0.0)
+            base = self._calculate_enhanced_score(query, row, predicted_category, faiss_score)
+
+            # Apply tiered AL strength with RELEVANCE CHECK
+            # Pass query context so lift is only applied if ticket is relevant
+            lift = _feedback_lift_for(
+                str(row['retrieved_id']), 
+                predicted_class, 
+                predicted_team,
+                query_embedding=query_embedding,
+                knowledge_base=self.knowledge_base,
+                embeddings=self.embeddings,
+                relevance_threshold=FEEDBACK_RELEVANCE_THRESHOLD,
+            )
+            # Optional positive boost: count global positives to amplify ranking for well-liked items
+            # Fetch raw global positives quickly (separate connection to avoid slowing loop too much)
+            pos_boost = 0.0
+            if FEEDBACK_ENABLED and FEEDBACK_POS_BOOST > 0:
+                try:
+                    conn_tmp = sqlite3.connect(os.getenv("FEEDBACK_DB_PATH", FEEDBACK_DB_PATH))
+                    cur_tmp = conn_tmp.cursor()
+                    cur_tmp.execute(
+                        "SELECT pos FROM feedback_agg WHERE retrieved_id=? AND scope_key='global'",
+                        (str(row['retrieved_id']),)
+                    )
+                    rtmp = cur_tmp.fetchone()
+                    if rtmp and rtmp[0] > 0:
+                        pos_boost = FEEDBACK_POS_BOOST * rtmp[0]
+                        # FIX B: Clamp pos_boost to prevent runaway scores
+                        pos_boost = min(pos_boost, 0.5)  # Cap at 0.5 to keep comparable to base scores
+                except Exception:
+                    pos_boost = 0.0
+                finally:
+                    try:
+                        conn_tmp.close()
+                    except Exception:
+                        pass
+            # FIX A: lift already includes FEEDBACK_LIFT_MULT from _feedback_lift_for.
+            scaled_lift = lift + pos_boost
+            if AL_TIER_ENABLED:
+                scaled_lift = float(scaled_lift) * float(tier_lift_scale)
+            
+            # PROTECTION: Don't demote high FAISS scores with feedback
+            # If FAISS found a near-perfect match, trust it over popularity signals
+            faiss_score = row.get('faiss_score', 0.0)
+            if faiss_score > 0.90:
+                # Perfect match - ignore feedback entirely
+                scaled_lift = 0.0
+                feedback_logger.debug(f"High FAISS score {faiss_score:.4f} - ignoring feedback lift")
+            elif faiss_score > 0.80:
+                # Very good match - limit feedback influence to prevent demotion
+                if scaled_lift < 0:  # Only limit negative lifts
+                    scaled_lift = max(scaled_lift, -0.05)  # Cap demotion at -0.05
+                    feedback_logger.debug(f"Good FAISS score {faiss_score:.4f} - limiting feedback demotion to -0.05")
+            
+            enhanced_scores.append(base + scaled_lift)
+            lifts.append(scaled_lift)
+            feedback_logger.debug(
+                f"Candidate id={row['retrieved_id']} base={base:.4f} raw_lift={lift:.4f} scaled_lift={scaled_lift:.4f} pos_boost={pos_boost:.4f} faiss={row.get('faiss_score'):.4f}"
+            )
         candidates['enhanced_score'] = enhanced_scores
+        candidates['feedback_lift'] = lifts
+        candidates['confidence_gated'] = False  # Mark that these went through AL
+        
+        # SCOPE VERIFICATION: Analyze lift distribution to verify scope matching
+        if FEEDBACK_ENABLED and len(lifts) > 0:
+            nonzero_lifts = [l for l in lifts if abs(l) > 0.01]
+            positive_lifts = [l for l in lifts if l > 0.01]
+            negative_lifts = [l for l in lifts if l < -0.01]
+            
+            feedback_logger.info(
+                f"Scope verification: query_class={predicted_class} query_team={predicted_team} | "
+                f"candidates_total={len(candidates)} lifts_nonzero={len(nonzero_lifts)} "
+                f"(+{len(positive_lifts)} pos, {len(negative_lifts)} neg) | "
+                f"avg_lift={sum(lifts)/len(lifts):.4f} max_lift={max(lifts):.4f} min_lift={min(lifts):.4f}"
+            )
         
         # Step 3: Re-rank and return top results
-        results = candidates.nlargest(top_k, 'enhanced_score')
-        return results[['first_reply', 'Title_anon', 'Description_anon', 'enhanced_score']]
+        # Prefer items with higher feedback_lift when enhanced_score ties or is close
+        results = (
+            candidates.sort_values(by=['enhanced_score', 'feedback_lift'], ascending=[False, False])
+            .head(top_k)
+        )
+        # Log top-N results with scores
+        if FEEDBACK_LOG_TOPN > 0 and feedback_logger.isEnabledFor(logging.INFO):
+            preview = []
+            for i, (_, r) in enumerate(results.head(FEEDBACK_LOG_TOPN).iterrows()):
+                preview.append(
+                    {
+                        "id": str(r.get('retrieved_id')),
+                        "faiss": float(r.get('faiss_score', 0.0)),
+                        "lift": float(r.get('feedback_lift', 0.0)),
+                        "enh": float(r.get('enhanced_score', 0.0)),
+                    }
+                )
+            feedback_logger.info(f"Top{min(FEEDBACK_LOG_TOPN, top_k)} after rerank: {preview}")
+        
+        # Return columns based on whether feedback is enabled.
+        # (Note: with tiering, feedback may be effectively disabled via lift_scale=0,
+        # but we keep the column for transparency when FEEDBACK_ENABLED is True.)
+        if FEEDBACK_ENABLED:
+            return results[['retrieved_id', 'first_reply', 'Title_anon', 'Description_anon', 'enhanced_score', 'feedback_lift', 'confidence_gated']]
+        results['confidence_gated'] = False
+        return results[['retrieved_id', 'first_reply', 'Title_anon', 'Description_anon', 'enhanced_score', 'confidence_gated']]
 
     def _calculate_enhanced_score(self, query, candidate_row, predicted_category, faiss_score):
-        """Calculate enhanced score considering multiple factors"""
-        # Base FAISS similarity (50%)
-        base_score = 0.5 * faiss_score
+        """Calculate enhanced score considering multiple factors
         
-        # Category match bonus (20%)
+        REBALANCED weights to give feedback room to dominate:
+        - Base components use 65% total (down from 100%)
+        - Feedback lift (±1.5 max) can now significantly impact rankings
+        - Prevents base score variance from overwhelming feedback signal
+        """
+        # Base FAISS similarity (40% weight) - Reduced from 50%
+        base_score = 0.4 * faiss_score
+        
+        # Category match bonus (12% weight) - Reduced from 20%
         category_bonus = 0.0
         if predicted_category and candidate_row.get('label_auto') == predicted_category:
-            category_bonus = 0.2
+            category_bonus = 0.12
         
-        # Title similarity (15%)
+        # Title similarity (8% weight) - Reduced from 15%
         title_sim = self._calculate_field_similarity(query, candidate_row.get('Title_anon', ''))
-        title_score = 0.15 * title_sim
+        title_score = 0.08 * title_sim
         
-        # Description similarity (10%)
+        # Description similarity (5% weight) - Reduced from 10%
         desc_sim = self._calculate_field_similarity(query, candidate_row.get('Description_anon', ''))
-        desc_score = 0.1 * desc_sim
+        desc_score = 0.05 * desc_sim
         
-        # Response quality bonus (5%)
-        quality_bonus = 0.05 * self._assess_response_quality(candidate_row.get('first_reply', ''))
+        # Quality bonus removed (was 5%) - redundant with FAISS similarity
         
-        return base_score + category_bonus + title_score + desc_score + quality_bonus
+        # Total base score now ranges from ~0.4 to ~0.65 (35% room for feedback)
+        # Feedback lift (±1.5 capped) is ADDED to this, giving it proper influence
+        return base_score + category_bonus + title_score + desc_score
 
     def _calculate_field_similarity(self, query, field_text):
         """Calculate similarity between query and specific field"""
@@ -518,12 +1288,13 @@ def _get_ticket_classifier():
         _ticket_tokenizer = DistilBertTokenizer.from_pretrained(ticket_classifier_path)
         _ticket_classifier = DistilBertForSequenceClassification.from_pretrained(ticket_classifier_path)
         
-        # Get device from team classifier or detect
-        _, _, device = _get_team_classifier()
-        if device is None:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        _ticket_classifier.to(device)
+        # Place ticket classifier on the same device we use for inference.
+        # Prefer the device configured by the lazy-loaded team classifier.
+        _, _, tc_device = _get_team_classifier()
+        if tc_device is None:
+            tc_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        _ticket_classifier.to(tc_device)
         _ticket_classifier.eval()
         
         # Load label encoder
@@ -536,9 +1307,9 @@ def _get_ticket_classifier():
         
         print(f"✅ Ticket classifier loaded successfully")
         print(f"📊 Ticket classifier classes: {_ticket_metadata['classes']}")
-        
+
         return _ticket_classifier, _ticket_tokenizer, _ticket_label_encoder, _ticket_metadata
-        
+
     except Exception as e:
         print(f"❌ Error loading ticket classifier: {e}")
         print("💡 Falling back to keyword-based classification")
@@ -570,6 +1341,8 @@ def classify_ticket(ticket_text, service_category=None, service_subcategory=None
     # Try using the trained model first
     if ticket_classifier is not None and ticket_tokenizer is not None and ticket_label_encoder is not None:
         try:
+            # Ensure inputs go to the same device as the model
+            tc_device = next(ticket_classifier.parameters()).device
             # Tokenize input
             inputs = ticket_tokenizer(
                 formatted_text,
@@ -577,7 +1350,7 @@ def classify_ticket(ticket_text, service_category=None, service_subcategory=None
                 truncation=True,
                 padding='max_length',
                 max_length=512
-            ).to(device)
+            ).to(tc_device)
             
             # Get prediction
             with torch.no_grad():
@@ -753,13 +1526,29 @@ def get_specific_instructions(classification, predicted_team):
     return result
 
 def analyze_response_type_simple(response_text):
-    """Simple analysis to determine if response is template-based or personalized"""
+    """Enhanced analysis to determine if response is template-based or personalized
+    
+    Returns:
+        tuple: (response_type: str, confidence: float, length_category: str)
+               response_type: "template", "personalized", or "mixed"
+               confidence: 0.0 to 1.0
+               length_category: "short" (<300 chars), "medium" (300-800), "long" (>800)
+    """
     if not response_text or pd.isna(response_text):
         return "unknown", 0.0
     
     text = str(response_text).lower()
+    text_length = len(response_text)
     
-    # Template indicators (simple keyword detection)
+    # Determine length category
+    if text_length < 300:
+        length_category = "short"
+    elif text_length < 800:
+        length_category = "medium"
+    else:
+        length_category = "long"
+    
+    # Template indicators (enhanced with more patterns)
     template_keywords = [
         "below you will find the additional form information",
         "need: extra information needed",
@@ -771,10 +1560,17 @@ def analyze_response_type_simple(response_text):
         "- employee id:",
         "automatically created",
         "auto-generated",
-        "this ticket has been"
+        "this ticket has been",
+        "important information:",
+        "please before submitting",
+        "required information",
+        "canonicalname:",
+        "memberof:",
+        "displayname:",
+        "the following required information"
     ]
     
-    # Personalized indicators
+    # Personalized indicators (enhanced with Italian language patterns)
     personalized_keywords = [
         "thank you for contacting",
         "i understand",
@@ -785,38 +1581,152 @@ def analyze_response_type_simple(response_text):
         "let me check",
         "please note that",
         "i recommend",
-        "thank you for your request"
+        "thank you for your request",
+        "grazie",  # Italian: thank you
+        "preferisco",  # Italian: I prefer
+        "come sede",  # Italian: as location
+        "per quanto riguarda",  # Italian: regarding
+        "ti contatto",  # Italian: I contact you
+        "buongiorno",  # Italian: good morning
+        "cordiali saluti"  # Italian: kind regards
     ]
     
     # Count matches
     template_score = sum(1 for keyword in template_keywords if keyword in text)
     personalized_score = sum(1 for keyword in personalized_keywords if keyword in text)
     
+    # Length-based scoring (short responses are usually personalized)
+    if text_length < 200:
+        personalized_score += 3  # Strong indicator of personalized response
+    elif text_length < 400:
+        personalized_score += 1  # Moderate indicator
+    elif text_length > 1000:
+        template_score += 2  # Long responses often templates
+    
     # Check for structured lists (template indicator)
     dash_lines = text.count('\n-')
     if dash_lines >= 3:
+        template_score += 3  # Increased weight for structured lists
+    elif dash_lines >= 1:
+        template_score += 1
+    
+    # Check for form fields (strong template indicator)
+    if ':' in text and text.count(':') >= 5:
         template_score += 2
     
     # Check for questions (personalized indicator)
     question_marks = text.count('?')
     if question_marks > 0:
-        personalized_score += 1
+        personalized_score += question_marks
+    
+    # Check for email-style formatting (template indicator)
+    if '***' in text or '####' in text or '====' in text:
+        template_score += 2
+    
+    # Check for first-person pronouns (personalized indicator)
+    first_person = ['i am', 'i will', 'i can', 'i have', 'my ', 'we will', 'we can']
+    first_person_count = sum(1 for phrase in first_person if phrase in text)
+    if first_person_count > 0:
+        personalized_score += first_person_count
     
     # Determine type
     total_score = template_score + personalized_score
     if total_score == 0:
-        return "unknown", 0.0
+        # Default based on length
+        if text_length < 300:
+            return "personalized", 0.7, length_category  # Short = likely personalized
+        else:
+            return "template", 0.6, length_category  # Long = likely template
     
     template_confidence = template_score / total_score
     
     if template_confidence > 0.6:
-        return "template", template_confidence
+        return "template", template_confidence, length_category
     elif template_confidence < 0.4:
-        return "personalized", 1 - template_confidence
+        return "personalized", 1 - template_confidence, length_category
     else:
-        return "mixed", 0.5
+        return "mixed", 0.5, length_category
 
 # Update OpenAI API call to ensure compatibility and proper response handling
+def generate_short_personalized_response(ticket_title, ticket_description, classification, predicted_team, similar_replies):
+    """Generate concise, personalized responses for short reply scenarios
+    
+    Args:
+        ticket_title: The ticket title
+        ticket_description: The ticket description  
+        classification: Predicted ticket type
+        predicted_team: Predicted team
+        similar_replies: DataFrame of similar tickets
+        
+    Returns:
+        str: A short, personalized response matching the expected style
+    """
+    
+    # Extract short examples from similar replies
+    short_examples = []
+    for _, reply in similar_replies.iterrows():
+        first_reply = str(reply.get('first_reply', ''))
+        if len(first_reply) < 400 and len(first_reply) > 30:  # Short but not empty
+            short_examples.append({
+                'reply': first_reply[:300],  # Limit context
+                'title': str(reply.get('Title_anon', ''))[:100]
+            })
+            if len(short_examples) >= 3:  # Limit to 3 examples
+                break
+    
+    # Build prompt for short response
+    examples_text = ""
+    if short_examples:
+        examples_text = "\n\nExamples of short, personalized responses:\n"
+        for i, ex in enumerate(short_examples, 1):
+            examples_text += f"\nExample {i}:\nTicket: {ex['title']}\nResponse: {ex['reply']}\n"
+    
+    prompt = f"""You are an IT support agent writing a SHORT, PERSONALIZED response (maximum 200 characters).
+
+CRITICAL RULES:
+- Keep it under 200 characters
+- Be direct and concise
+- Match the user's language (English/Italian)
+- Answer their specific question or acknowledge their request
+- NO form fields, NO templates, NO structured lists
+- NO email headers or signatures
+
+Current Ticket:
+Title: {ticket_title}
+Description: {ticket_description}
+Classification: {classification}
+Team: {predicted_team}
+{examples_text}
+
+Write a SHORT, personalized response (max 200 chars):"""
+
+    try:
+        messages = [
+            {"role": "system", "content": "You are an IT support agent who writes very short, personalized responses. Maximum 200 characters. No templates."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        generated_reply = _chat_completion(
+            model=GEN_MODEL_SHORT,
+            messages=messages,
+            max_tokens=GEN_MAX_TOKENS_SHORT,  # Limit tokens for short response
+            temperature=GEN_TEMPERATURE_SHORT,  # Higher temperature for natural variation
+            top_p=0.9
+        )
+        
+        # Enforce length limit
+        if len(generated_reply) > 300:
+            generated_reply = generated_reply[:297] + "..."
+            
+        logger.info(f"Generated short personalized response: {len(generated_reply)} chars")
+        return generated_reply
+        
+    except Exception as e:
+        logger.error(f"Error generating short response: {e}")
+        # Fallback to very simple response
+        return f"Thank you for your message. The {predicted_team} team will review your request."
+
+
 def generate_response_with_openai_personal(ticket_title, ticket_description, classification, predicted_team, team_confidence, similar_replies):
     """Enhanced personalized response generation with better context awareness"""
     
@@ -866,13 +1776,13 @@ def generate_response_with_openai_personal(ticket_title, ticket_description, cla
 
     # NO TRY-EXCEPT - Let errors propagate to see what's wrong
     return _chat_completion(
-        model="gpt-3.5-turbo",
+    model=GEN_MODEL_PERSONAL,
         messages=[
             {"role": "system", "content": "You are an expert IT support specialist who writes clear, professional responses that match organizational standards."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=400,
-        temperature=0.3,
+    max_tokens=GEN_MAX_TOKENS_PERSONAL,
+    temperature=GEN_TEMPERATURE_PERSONAL,
         top_p=0.8,
         frequency_penalty=0.1,
         presence_penalty=0.2
@@ -960,13 +1870,13 @@ def generate_status_update_response(ticket_title, ticket_description, classifica
 
     # NO TRY-EXCEPT - Let errors propagate to see what's wrong
     return _chat_completion(
-        model="gpt-3.5-turbo",
+    model=GEN_MODEL_STATUS,
         messages=[
             {"role": "system", "content": "You are an IT operations communicator writing concise status updates."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=300,
-        temperature=0.2,
+    max_tokens=GEN_MAX_TOKENS_STATUS,
+    temperature=GEN_TEMPERATURE_STATUS,
         top_p=0.8
     )
 
@@ -1062,21 +1972,37 @@ def generate_response_with_openai(ticket_title, ticket_description, classificati
     # Analyze similar replies to determine response type
     template_examples = []
     personalized_examples = []
+    short_examples = []
     
     print(f"🔍 Analyzing {len(similar_replies)} similar replies...")
     
     for _, reply in similar_replies.iterrows():
         first_reply = str(reply.get('first_reply', ''))
-        response_type, confidence = analyze_response_type_simple(first_reply)
+        response_type, confidence, length_category = analyze_response_type_simple(first_reply)
         
-        print(f"   Reply: {response_type} (confidence: {confidence:.2f})")
+        print(f"   Reply: {response_type} (confidence: {confidence:.2f}, length: {length_category})")
         
-        if response_type == "template" and confidence > 0.5:
+        if length_category == "short" and len(first_reply) < 400:
+            short_examples.append(reply)
+        elif response_type == "template" and confidence > 0.5:
             template_examples.append(reply)
         elif response_type == "personalized" and confidence > 0.5:
             personalized_examples.append(reply)
     
-    # Decide which approach to use
+    # Check if we should generate a short response
+    has_short_replies = len(short_examples) >= 2 or (len(short_examples) > 0 and len(short_examples) >= len(template_examples))
+    
+    if has_short_replies:
+        print(f"📝 Detected SHORT REPLY pattern ({len(short_examples)} short examples)")
+        print("   Using specialized short response generator...")
+        # Convert to DataFrame
+        if isinstance(short_examples[0], pd.Series):
+            short_df = pd.DataFrame(short_examples)
+        else:
+            short_df = pd.DataFrame(short_examples)
+        return generate_short_personalized_response(ticket_title, ticket_description, classification, predicted_team, short_df)
+    
+    # Decide which approach to use for standard responses
     use_template = len(template_examples) > len(personalized_examples)
 
     # If temporal/status-update context is detected, prefer personalized status-update responses
@@ -1087,6 +2013,7 @@ def generate_response_with_openai(ticket_title, ticket_description, classificati
     print(f"📊 Decision: {'Template' if use_template else 'Personalized'}")
     print(f"   Template examples: {len(template_examples)}")
     print(f"   Personalized examples: {len(personalized_examples)}")
+    print(f"   Short examples: {len(short_examples)}")
     
     # Generate appropriate response using existing functions
     if use_template and template_examples:
@@ -1117,74 +2044,65 @@ def generate_response_with_openai(ticket_title, ticket_description, classificati
 # Replace the existing generate_template_response_function with this:
 
 def generate_template_response_function(ticket_title, ticket_description, classification, predicted_team, template_examples):
-    """Generate template-based response with enhanced similarity matching"""
+    """Generate template-based response using LEGACY-PARITY simple strict prompt (like resolution_task_no_feedback.py)"""
     
     # Ensure template_examples is a DataFrame
     if isinstance(template_examples, list):
         template_examples = pd.DataFrame(template_examples)
     
-    # Enhanced template selection - find the MOST similar template
-    if len(template_examples) > 1:
-        template_examples = select_best_templates(ticket_title, ticket_description, template_examples, top_k=3)
-    
-    # Create more specific prompts based on ticket type
-    specific_instructions = get_specific_instructions(classification, predicted_team)
-    
+    # LEGACY PARITY: Simple, strict prompt matching the old high-performing system
     prompt = (
         f"You are an IT support system that generates STRUCTURED TEMPLATE RESPONSES. "
         f"You must follow the EXACT format and structure shown in the examples below.\n\n"
-        f"CRITICAL INSTRUCTIONS:\n"
-        f"- Copy the EXACT format from the most similar ticket\n"
-        f"- Use IDENTICAL structure, field names, and formatting\n"
-        f"- Replace ONLY the specific values (names, IDs, etc.)\n"
-        f"- Keep ALL punctuation, spacing, and line breaks\n"
-        f"- Start with 'Below you will find' when appropriate\n"
-        f"- Use bullet points (-) exactly as shown\n"
-        f"{specific_instructions}\n\n"
-        f"Current Ticket:\n"
-        f"Title: {ticket_title}\n"
-        f"Description: {ticket_description}\n"
+        f"IMPORTANT INSTRUCTIONS:\n"
+        f"- Copy the EXACT format from similar tickets\n"
+        f"- Use structured lists with dashes (-)\n"
+        f"- Include form fields like 'Need:', 'Project Manager Full name:', etc.\n"
+        f"- Do NOT write conversational responses\n"
+        f"- Start with 'Below you will find the additional form information' when appropriate\n"
+        f"- For onboarding tickets, use brief auto-generated messages\n\n"
+        f"Ticket Title: {ticket_title}\n"
+        f"Ticket Description: {ticket_description}\n"
         f"Request Type: {classification}\n"
         f"Assigned Team: {predicted_team}\n\n"
-        f"TEMPLATE EXAMPLES (RANKED BY SIMILARITY):\n"
+        f"TEMPLATE EXAMPLES FROM SIMILAR TICKETS:\n"
     )
     
-    # Add template examples with enhanced context
+    # Add template examples - simple iteration, no ranking/filtering complexity
     example_count = 0
     for index, reply in template_examples.iterrows():
-        if example_count >= 2:  # Reduced to 2 best examples for focus
+        if example_count >= 3:  # Limit to 3 examples (legacy behavior)
             break
             
-        similarity_note = f"[SIMILARITY: {reply.get('enhanced_score', 0.0):.3f}]" if 'enhanced_score' in reply else ""
         prompt += (
-            f"EXAMPLE {example_count + 1} {similarity_note}:\n"
+            f"EXAMPLE {example_count + 1}:\n"
             f"Title: {reply.get('Title_anon', 'N/A')}\n"
-            f"Description: {reply.get('Description_anon', 'N/A')[:200]}...\n"
-            f"EXACT TEMPLATE TO FOLLOW:\n{reply.get('first_reply', 'N/A')}\n"
-            f"{'='*60}\n\n"
+            f"Description: {reply.get('Description_anon', 'N/A')}\n"
+            f"Template Response:\n{reply.get('first_reply', 'N/A')}\n"
+            f"{'='*50}\n\n"
         )
         example_count += 1
     
     prompt += (
-        f"GENERATE RESPONSE:\n"
-        f"Use the EXACT structure from the most similar example above. "
-        f"Copy the format precisely - same field names, same punctuation, same layout. "
-        f"Change ONLY the specific details relevant to the current ticket. "
-        f"Do NOT add extra text or modify the template structure."
+        f"GENERATE THE RESPONSE:\n"
+        f"Follow the EXACT structure and format from the examples above. "
+        f"Use the same field names, formatting, and template structure. "
+        f"Replace only the specific values (names, computer IDs, etc.) that are relevant to the new ticket. "
+        f"Do NOT add conversational language or explanations."
     )
 
-    print("Prompt sent to OpenAI API (Enhanced Template):")
-    print(prompt[:800] + "..." if len(prompt) > 800 else prompt)
+    print("Prompt sent to OpenAI API (Template - Legacy Parity):")
+    print(prompt[:500] + "..." if len(prompt) > 500 else prompt)
 
-    # NO TRY-EXCEPT - Let errors propagate to see what's wrong
+    # Use configured generation settings
     return _chat_completion(
-        model="gpt-3.5-turbo",
+        model=GEN_MODEL_TEMPLATE,
         messages=[
             {"role": "system", "content": "You are an IT support system that generates responses matching the exact format and style of provided examples."},
             {"role": "user", "content": prompt}
         ],
-        max_tokens=800,
-        temperature=0.2,
+        max_tokens=GEN_MAX_TOKENS_TEMPLATE,
+        temperature=GEN_TEMPERATURE_TEMPLATE,
         top_p=0.8,
         frequency_penalty=0.1,
         presence_penalty=0.1
@@ -1301,9 +2219,17 @@ def generate_template_response_function(ticket_title, ticket_description, classi
 
 # Ensure the result dictionary contains all expected keys
 def generate_response(ticket_title, ticket_description, rag_system, retrieval_k: int = 5):
-    """Enhanced response generation with improved retrieval"""
-    ticket_text = ticket_title + " " + ticket_description
+    """Enhanced response generation with improved retrieval and optional profiling"""
+    import time
+    profile_enabled = os.getenv("PROFILE_API", "false").lower() in ("1", "true", "yes")
+    timings = {} if profile_enabled else None
+    
+    ticket_text = str(ticket_title) + " " + str(ticket_description)
+    
+    # Step 1: Classification
+    if profile_enabled: t0 = time.time()
     word_class, template = classify_ticket(ticket_text)
+    if profile_enabled: timings['classify_ticket'] = time.time() - t0
 
     # Map word_class to category labels for filtering
     category_mapping = {
@@ -1316,30 +2242,46 @@ def generate_response(ticket_title, ticket_description, rag_system, retrieval_k:
     }
     
     predicted_category = category_mapping.get(word_class, None)
+    
+    # Step 2: Team classification
+    if profile_enabled: t0 = time.time()
     predicted_team, team_confidence = classify_team_with_distilbert(ticket_text)
+    if profile_enabled: timings['classify_team'] = time.time() - t0
 
     # Detect temporal/status-update context and pass to generator
     temporal_context = detect_temporal_context(ticket_title, ticket_description)
 
-    # Use enhanced retrieval with category awareness
+    # Step 3: Retrieval with feedback
+    if profile_enabled: t0 = time.time()
     similar_replies = rag_system.retrieve_similar_replies(
         ticket_text,
         top_k=retrieval_k,
-        predicted_category=predicted_category
+        predicted_category=predicted_category,
+        predicted_class=word_class,
+        predicted_team=predicted_team,
     )
+    if profile_enabled: timings['retrieval'] = time.time() - t0
 
-    # Generate response with better context
+    # Step 4: LLM response generation
+    if profile_enabled: t0 = time.time()
     response = generate_response_with_openai(ticket_title, ticket_description, word_class, predicted_team, team_confidence, similar_replies, temporal_context=temporal_context)
+    if profile_enabled: timings['llm_generation'] = time.time() - t0
 
-    return {
+    result = {
         "classification": word_class,
-    "predicted_team": predicted_team,
-    "team_confidence": team_confidence,
+        "predicted_team": predicted_team,
+        "team_confidence": team_confidence,
         "response": response,
         "similar_replies": similar_replies.to_dict(orient="records"),
-    "predicted_class": word_class,
-    "retrieval_k": retrieval_k
+        "predicted_class": word_class,
+        "retrieval_k": retrieval_k
     }
+    
+    if profile_enabled:
+        result['_generation_profiling'] = timings
+        logger.info(f"⏱️ GEN: ticket={timings.get('classify_ticket',0):.2f}s team={timings.get('classify_team',0):.2f}s retrieval={timings.get('retrieval',0):.2f}s llm={timings.get('llm_generation',0):.2f}s")
+    
+    return result
 
 ############################
 # CACHING LAYER FOR RAG
@@ -1639,6 +2581,7 @@ def save_resolved_ticket_with_feedback(
                     print(f"💡 New ticket immediately available for retrieval!")
                 else:
                     print(f"⚠️ Verification failed: Expected +1, got index +{final_index_size - old_index_size}, KB +{final_kb_size - old_kb_size}")
+                   
                     raise Exception("Incremental update verification failed")
                 
             except Exception as e:
@@ -1677,15 +2620,91 @@ def save_resolved_ticket_with_feedback(
 
 # Main function to process a new ticket (now cached)
 def process_new_ticket(ticket_title, ticket_description, knowledge_base_path="tickets_large_first_reply_label_copy.csv", force_rebuild=False, top_k: int = 5):
-    rag_system, df = _get_or_build_rag(knowledge_base_path, force_rebuild=force_rebuild)
-    result = generate_response(ticket_title, ticket_description, rag_system, retrieval_k=top_k)
+    """Process a new ticket with optional performance profiling."""
+    import time
+    profile_enabled = os.getenv("PROFILE_API", "false").lower() in ("1", "true", "yes")
+    
+    if profile_enabled:
+        timings = {}
+        start_total = time.time()
+        
+        # Step 1: Get RAG system
+        t0 = time.time()
+        rag_system, df = _get_or_build_rag(knowledge_base_path, force_rebuild=force_rebuild)
+        timings['rag_load'] = time.time() - t0
+        
+        # Step 2: Generate response
+        t0 = time.time()
+        result = generate_response(ticket_title, ticket_description, rag_system, retrieval_k=top_k)
+        timings['generation'] = time.time() - t0
+        
+        timings['total'] = time.time() - start_total
+        result['_profiling'] = timings
+        
+        logger.info(f"⏱️ PROFILING: total={timings['total']:.2f}s rag={timings['rag_load']:.2f}s gen={timings['generation']:.2f}s")
+        return result
+    else:
+        rag_system, df = _get_or_build_rag(knowledge_base_path, force_rebuild=force_rebuild)
+        result = generate_response(ticket_title, ticket_description, rag_system, retrieval_k=top_k)
+        return result
 
-    # NO FALLBACK - Let any errors propagate so we can see what's wrong
-    return result
+def retrieve_only(
+    ticket_title: str,
+    ticket_description: str,
+    knowledge_base_path: str = DEFAULT_KB_PATH,
+    top_k: int = 5,
+    predicted_class: Optional[str] = None,
+    predicted_team: Optional[str] = None,
+):
+    """Return only retrieval results with feedback-aware reranking, no LLM generation.
+
+    This computes the same classification and team prediction used by generate_response
+    to ensure retrieval filtering context matches, then returns only the retrieved items
+    as a list of dicts plus basic metadata.
+    """
+    rag_system, df = _get_or_build_rag(knowledge_base_path, force_rebuild=False)
+
+    ticket_text = f"{ticket_title} {ticket_description}"
+    # Use provided predictions when available to keep scope consistent across reranks
+    if predicted_class is None:
+        predicted_class, _ = classify_ticket(ticket_text)
+    else:
+        word_class = predicted_class
+    if predicted_team is None:
+        predicted_team, team_confidence = classify_team_with_distilbert(ticket_text)
+    else:
+        team_confidence = None
+
+    category_mapping = {
+        "vpn_request": "to enable Client-to-Site VPN tunnel requests",
+        "onboarding": "to start the IT On-boarding of a new internal employee",
+        "software_request": "to request a software or a licence on my Windows device",
+        "offboarding": "to start the IT Off-boarding process",
+        "absence_request": "to request an Absence ticket",
+        "admin_rights": "to request admin rights on the computer",
+    }
+    predicted_category = category_mapping.get(predicted_class or word_class, None)
+
+    # Ensure feedback functions in RAG use the current DB path via env
+    similar_replies = rag_system.retrieve_similar_replies(
+        ticket_text,
+        top_k=top_k,
+        predicted_category=predicted_category,
+    predicted_class=predicted_class or word_class,
+        predicted_team=predicted_team,
+    )
+
+    return {
+    "predicted_class": predicted_class or word_class,
+        "predicted_team": predicted_team,
+        "team_confidence": team_confidence,
+        "similar_replies": similar_replies.to_dict(orient="records"),
+        "retrieval_k": top_k,
+    }
 
 # Example usage
 if __name__ == "__main__":
-    knowledge_base_path = "tickets_large_first_reply_label.csv"#"tickets_large_first_reply_label.csv"
+    knowledge_base_path = "tickets_large_first_reply_label_copy.csv"#"tickets_large_first_reply_label.csv"
     ticket_title = "VPN access request"
     ticket_description = "Requesting VPN access for project KE-123456. User: Jane Smith."
 
@@ -1695,4 +2714,4 @@ if __name__ == "__main__":
     print("Predicted Team:", result["predicted_team"])
     print("Generated Response:", result["response"])
     print("Similar Replies:", result["similar_replies"])
-    # save_resolved_ticket_with_feedback(ticket_title, ticket_description, result["response"])   
+    # save_resolved_ticket_with_feedback(ticket_title, ticket_description, result["response"])
