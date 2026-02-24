@@ -78,28 +78,40 @@ DEFAULT_KB_PATH = os.getenv("KNOWLEDGE_BASE_PATH", "tickets_large_first_reply_la
 # LLM configuration
 LLM_MODEL = "gpt-3.5-turbo"
 LLM_MAX_TOKENS = 400  # Reduced from 800 for speed
-LLM_TEMPERATURE = 0.2
+# Temperature 0.0: eliminates LLM sampling noise between AL and baseline.
+# Previous analysis showed 88% of "different responses" at T=0.2 were just
+# stochastic variance, not meaningful retrieval differences.
+LLM_TEMPERATURE = 0.0
 
-# Feedback/reranking configuration (Laplace smoothing + stronger lifts)
+# Feedback/reranking configuration
+# ────────────────────────────────────────────────────────────────────────────
+# POSITIVE-ONLY FEEDBACK (2026-02-01)
+#
+# Root-cause analysis of 3× 80-ticket evals showed:
+#   • Negative lift is UNRELIABLE with sparse self-teaching data: a ticket
+#     judged poor for one query may be perfect for another.
+#   • Bayesian (Laplace) smoothing is asymmetric — 1 neg vote → lift=-0.125
+#     but 1 pos vote → lift=0.0.  This systematically hurts AL.
+#   • The pos_boost (0.10×pos) double-counts positive signal on top of lift.
+#
+# FIX: Only apply positive lift.  Never demote.  Keep influence small so FAISS
+#      (the strongest ranking signal) is respected.
+# ────────────────────────────────────────────────────────────────────────────
 FEEDBACK_DB_PATH = os.getenv("FEEDBACK_DB_PATH", "feedback_refid.db")
 FEEDBACK_ENABLED = bool(os.getenv("FEEDBACK_ENABLED", "True").lower() in ['true', '1', 'yes'])  # TOGGLE for A/B testing
 FEEDBACK_ALPHA = float(os.getenv("FEEDBACK_ALPHA", "1.0"))  # Laplace alpha
 FEEDBACK_BETA = float(os.getenv("FEEDBACK_BETA", "1.0"))    # Laplace beta
-# Require more total votes before feedback reaches full strength.
-# OPTIMIZED - Lowered from 10 to 5 for better coverage
-FEEDBACK_MIN_COUNT = int(os.getenv("FEEDBACK_MIN_COUNT", "2"))  # Lowered to increase % of tickets affected
-# Slightly more balanced weights across scopes so no single scope dominates.
-# Rebalanced feedback weights:
-# Global feedback can become a "popularity prior" and hurt on strong retrieval.
-# Prefer class/team-scoped signal when available; keep global as a small backstop.
+FEEDBACK_MIN_COUNT = int(os.getenv("FEEDBACK_MIN_COUNT", "2"))
 FEEDBACK_W_GLOBAL = float(os.getenv("FEEDBACK_W_GLOBAL", "0.10"))
 FEEDBACK_W_CLASS = float(os.getenv("FEEDBACK_W_CLASS", "0.55"))
 FEEDBACK_W_TEAM = float(os.getenv("FEEDBACK_W_TEAM", "0.35"))
-# Cap how much feedback can move the score; keep it as a bias, not a full override.
-# FIXED: Lowered from 1.5 to 0.5 - feedback was over-valuing popular tickets
-FEEDBACK_TOTAL_LIFT_CAP = float(os.getenv("FEEDBACK_TOTAL_LIFT_CAP", "0.5"))  # FIXED: Was 1.5, causing popular tickets to overtake perfect FAISS matches
-FEEDBACK_LIFT_MULT = float(os.getenv("FEEDBACK_LIFT_MULT", "1.5"))  # FIXED: Was 4.0, reduced to prevent demoting high FAISS scores
-FEEDBACK_POS_BOOST = float(os.getenv("FEEDBACK_POS_BOOST", "0.10"))  # Reduced from 0.10
+# Lift multiplier & cap — deliberately SMALL so feedback is a gentle nudge.
+FEEDBACK_TOTAL_LIFT_CAP = float(os.getenv("FEEDBACK_TOTAL_LIFT_CAP", "0.15"))
+FEEDBACK_LIFT_MULT = float(os.getenv("FEEDBACK_LIFT_MULT", "0.5"))
+# pos_boost DISABLED: it double-counted positive signal and added uncontrolled noise
+FEEDBACK_POS_BOOST = float(os.getenv("FEEDBACK_POS_BOOST", "0.0"))
+# Positive-only mode: never apply negative lift (floor at 0)
+FEEDBACK_POSITIVE_ONLY = bool(os.getenv("FEEDBACK_POSITIVE_ONLY", "true").lower() in ['true', '1', 'yes'])
 FEEDBACK_LOG_LEVEL = os.getenv("FEEDBACK_LOG_LEVEL", "INFO").upper()
 FEEDBACK_LOG_TOPN = int(os.getenv("FEEDBACK_LOG_TOPN", "5"))
 # Pre-FAISS feedback boost: DISABLED - was breaking retrieval with insufficient data
@@ -113,17 +125,44 @@ FEEDBACK_PRE_SEARCH = bool(os.getenv("FEEDBACK_PRE_SEARCH", "false").lower() in 
 FEEDBACK_MAX_INJECT = int(os.getenv("FEEDBACK_MAX_INJECT", "0"))  # 0 = no injection, only re-rank
 
 # ============================================================================
-# CONFIDENCE-BASED GATING (CORRECTED 2026-01-30 - LOGIC INVERTED)
+# EVIDENCE-BASED GATING (2026-02-17 — data from 300 unbiased tickets)
 # ============================================================================
-
 #
-# IMPLEMENTATION:
-# - Gate OFF AL when baseline cosine < 0.60 (weak retrieval, 59% of tickets)
-# - Activate AL when baseline cosine ≥ 0.60 (strong retrieval, 41% of tickets)
-# - Expected improvement: +1.5% over baseline (vs previous -1.6%)
+# Unbiased analysis of 300 tickets (3×100, 0% failure rate, Feb 16 2026):
+#
+#   SIGNAL: Baseline response cosine (proxy: FAISS top-1 score)
+#   ─────────────────────────────────────────────────────────────
+#   CosBase ≤ 0.6  →  AL avgΔ = +0.0068, 53% win rate, n=130  ✅ ACTIVATE
+#   CosBase > 0.6  →  AL avgΔ = -0.0145, 31% win rate, n=170  ❌ GATE OFF
+#
+#   SIGNAL: Predicted category
+#   ─────────────────────────────────────────────────────────────
+#   vpn_request, password_reset, absence_request → AL helps     ✅
+#   software_request, onboarding, email_support  → AL hurts     ❌
+#
+#   SIGNAL: Predicted team
+#   ─────────────────────────────────────────────────────────────
+#   Positive-team-only gating → avgΔ = +0.00256 (best composite)
+#
+#   BEST COMPOSITE RULE:
+#   Activate AL when baseline is WEAK (FAISS top-1 < threshold)
+#   → avgΔ swings from -0.00335 (ungated) to +0.00217 (gated)
+#
+# KEY INSIGHT: AL is a RESCUE mechanism — it helps when baseline retrieval
+# is poor (shuffling mediocre candidates can find better ones), but HURTS
+# when baseline is already good (re-ranking breaks a good ordering).
+# This is the OPPOSITE of the previous (Jan 30) hypothesis which was
+# derived from survivor-biased data.
 #
 FEEDBACK_CONFIDENCE_GATE = bool(os.getenv("FEEDBACK_CONFIDENCE_GATE", "true").lower() in ['true', '1', 'yes'])
-FEEDBACK_CONFIDENCE_THRESHOLD = float(os.getenv("FEEDBACK_CONFIDENCE_THRESHOLD", "0.60"))  # CORRECTED: Now gates OFF below threshold
+# Gate OFF when FAISS top-1 score EXCEEDS this threshold (strong baseline → don't touch)
+FEEDBACK_GATE_FAISS_CEILING = float(os.getenv("FEEDBACK_GATE_FAISS_CEILING", "0.75"))
+# Categories where AL reliably helps (from 300-ticket analysis)
+FEEDBACK_GATE_POSITIVE_CLASSES = set(
+    os.getenv("FEEDBACK_GATE_POSITIVE_CLASSES", "vpn_request,password_reset,absence_request").split(",")
+)
+# If true, require BOTH weak baseline AND positive class (stricter, higher precision)
+FEEDBACK_GATE_REQUIRE_BOTH = bool(os.getenv("FEEDBACK_GATE_REQUIRE_BOTH", "false").lower() in ['true', '1', 'yes'])
 
 # ============================================================================
 # RELEVANCE-FILTERED FEEDBACK (NEW)
@@ -459,10 +498,27 @@ def _feedback_lift_for(
         row = cur.fetchone()
         pos, neg = (row or (0, 0))
         
-        # Bayesian smoothing
-        p = (pos + FEEDBACK_ALPHA) / (pos + neg + FEEDBACK_ALPHA + FEEDBACK_BETA)
-        scale = min(1.0, (pos + neg) / max(1, FEEDBACK_MIN_COUNT))
-        lift = (p - 0.5) * scale * FEEDBACK_LIFT_MULT
+        if FEEDBACK_POSITIVE_ONLY:
+            # ── POSITIVE-ONLY BAYESIAN LIFT ──
+            # Ignore negative votes entirely in the formula.
+            # Rationale: with sparse self-teaching (~1 vote/item) neg votes are
+            # unreliable — an item judged poor for query A may be perfect for B.
+            # Including neg in the denominator *dilutes* legitimate positive signal
+            # (e.g., 1 pos + 1 neg → lift=0 instead of +0.042).
+            #
+            # Formula: p = (pos + α) / (pos + α + β)   [neg excluded]
+            #          scale = min(1, pos / MIN_COUNT)  [scale by pos count only]
+            p = (pos + FEEDBACK_ALPHA) / (pos + FEEDBACK_ALPHA + FEEDBACK_BETA)
+            scale = min(1.0, pos / max(1, FEEDBACK_MIN_COUNT))
+            lift = (p - 0.5) * scale * FEEDBACK_LIFT_MULT
+            # Floor at 0 (should never be negative with pos-only formula, but safety check)
+            if lift < 0:
+                lift = 0.0
+        else:
+            # Standard Bayesian smoothing (includes neg votes)
+            p = (pos + FEEDBACK_ALPHA) / (pos + neg + FEEDBACK_ALPHA + FEEDBACK_BETA)
+            scale = min(1.0, (pos + neg) / max(1, FEEDBACK_MIN_COUNT))
+            lift = (p - 0.5) * scale * FEEDBACK_LIFT_MULT
         
         # Cap individual lift
         if lift > FEEDBACK_TOTAL_LIFT_CAP:
@@ -471,7 +527,7 @@ def _feedback_lift_for(
             lift = -FEEDBACK_TOTAL_LIFT_CAP
         
         feedback_logger.debug(
-            f"Feedback lift for {retrieved_id}: pos={pos} neg={neg} p={p:.4f} scale={scale:.4f} lift={lift:.4f} [RELEVANT]"
+            f"Feedback lift for {retrieved_id}: pos={pos} neg={neg} p={p:.4f} scale={scale:.4f} lift={lift:.4f} [RELEVANT, pos_only={FEEDBACK_POSITIVE_ONLY}]"
         )
         return lift
     finally:
@@ -577,10 +633,13 @@ GEN_MAX_TOKENS_PERSONAL = _env_int("GEN_MAX_TOKENS_PERSONAL", 800)
 GEN_MAX_TOKENS_SHORT = _env_int("GEN_MAX_TOKENS_SHORT", 150)
 GEN_MAX_TOKENS_STATUS = _env_int("GEN_MAX_TOKENS_STATUS", 300)
 
-GEN_TEMPERATURE_TEMPLATE = _env_float("GEN_TEMPERATURE_TEMPLATE", 0.2)
-GEN_TEMPERATURE_PERSONAL = _env_float("GEN_TEMPERATURE_PERSONAL", 0.2)
-GEN_TEMPERATURE_SHORT = _env_float("GEN_TEMPERATURE_SHORT", 0.7)
-GEN_TEMPERATURE_STATUS = _env_float("GEN_TEMPERATURE_STATUS", 0.2)
+# Temperature 0.0 for ALL generators: eliminates LLM sampling noise between
+# AL and baseline passes so score differences reflect retrieval, not randomness.
+# Previous analysis showed 88% of "different responses" at T=0.2 were just stochastic.
+GEN_TEMPERATURE_TEMPLATE = _env_float("GEN_TEMPERATURE_TEMPLATE", 0.0)
+GEN_TEMPERATURE_PERSONAL = _env_float("GEN_TEMPERATURE_PERSONAL", 0.0)
+GEN_TEMPERATURE_SHORT = _env_float("GEN_TEMPERATURE_SHORT", 0.0)
+GEN_TEMPERATURE_STATUS = _env_float("GEN_TEMPERATURE_STATUS", 0.0)
 
 # LAZY LOADING: Initialize model references to None
 # Models will be loaded only when first needed, reducing startup time
@@ -920,63 +979,51 @@ class RAGSystem:
             quality_proxy = None
 
         # ============================================================================
-        # OPTIMAL CONFIDENCE-BASED GATING: Evidence-Based AL Activation
+        # EVIDENCE-BASED GATING (2026-02-17)
         # ============================================================================
-        # Comprehensive manual analysis of 318 tickets across 4 evaluations (2026-01-29)
-        # revealed the OPTIMAL pattern:
-        # 
-        # 🎯 BEST RULE: Use AL ONLY when baseline retrieval is WEAK (judge score ≤ 0.20)
-        # 
-        # Evidence:
-        # - 25 tickets (16.4% usage rate)
-        # - 56% help rate when activated
-        # - +0.9758% average improvement
-        # - Expected gain: +387.8% over current gating!
-        # 
-        # Pattern Discovery:
-        # ✅ When baseline WEAK (judge ≤ 0.20): AL helps 56% of time, improves +0.98%
-        # ❌ When baseline DECENT (judge > 0.20): AL helps 52.5%, but hurts more (-0.12%)
-        # ❌ When baseline STRONG (judge > 0.80): AL helps only 50%, hurts -2.32%
-        # 
-        # Key Insight: AL is RESCUE mechanism for failed baseline retrieval, 
-        # NOT an enhancement for already-working retrieval!
+        # Unbiased analysis of 300 tickets (3×100, 0% failure, Feb 16 2026):
+        #   AL helps when baseline is WEAK (FAISS top-1 low) — it's a rescue mechanism.
+        #   AL hurts when baseline is STRONG — re-ranking disrupts a good ordering.
+        #
+        # Rule: Gate OFF AL when FAISS top-1 ≥ ceiling (strong baseline, don't touch).
+        #       Optionally also gate by predicted category.
         feedback_gated = False
+        gate_reason = ""
         if FEEDBACK_ENABLED and FEEDBACK_CONFIDENCE_GATE and quality_proxy is not None:
             max_faiss_score = float(distances[0][0]) if len(distances[0]) > 0 else 0.0
             
-            # CORRECTED GATING LOGIC (2026-01-30) - INVERTED FROM PREVIOUS VERSION
-            # ======================================================================
-            # CRITICAL DISCOVERY from analysis of 316 tickets:
-            #   Correlation(baseline_cosine, AL_delta) = -0.206 (p=0.0002)
-            # 
-            # THIS MEANS: AL helps MORE when baseline is ALREADY STRONG!
-            # 
-            # Evidence:
-            #   AL HELPS  (27 tickets): Avg baseline cosine = 0.4766 → AL improves +9%
-            #   AL HURTS  (25 tickets): Avg baseline cosine = 0.6733 → AL degrades -13%
-            # 
-            # KEY INSIGHT:
-            # AL is an OPTIMIZER, not a RESCUER
-            # - When baseline is WEAK: Retrieved docs are poor → AL reranking of garbage = garbage
-            # - When baseline is STRONG: Retrieved docs are good → AL optimizes ranking = better results
-            # 
-            # THEREFORE: Gate OFF weak baselines, ACTIVATE strong baselines
-            # (This is the OPPOSITE of our previous hypothesis)
+            # Signal 1: FAISS top-1 score — is the baseline retrieval strong?
+            baseline_is_strong = max_faiss_score >= FEEDBACK_GATE_FAISS_CEILING
             
-            STRONG_BASELINE_THRESHOLD = 0.60  # Gate OFF if cosine < 0.60 (weak baseline)
+            # Signal 2: Predicted class — does AL historically help this class?
+            class_is_positive = predicted_class in FEEDBACK_GATE_POSITIVE_CLASSES
             
-            if max_faiss_score < STRONG_BASELINE_THRESHOLD:
-                # Baseline retrieval is WEAK - AL cannot rescue poor retrieval!
-                feedback_gated = True
-                feedback_logger.info(
-                    f"🚫 CORRECTED GATE: Baseline retrieval is WEAK ({max_faiss_score:.4f} < {STRONG_BASELINE_THRESHOLD:.2f}) - "
-                    f"AL cannot rescue poor retrieval. Using baseline only."
-                )
+            if FEEDBACK_GATE_REQUIRE_BOTH:
+                # Strict mode: activate AL only when BOTH signals agree
+                # (weak baseline AND positive class)
+                if baseline_is_strong or not class_is_positive:
+                    feedback_gated = True
+                    gate_reason = (
+                        f"STRICT GATE: baseline_strong={baseline_is_strong} "
+                        f"(FAISS={max_faiss_score:.4f} vs ceil={FEEDBACK_GATE_FAISS_CEILING:.2f}), "
+                        f"class_positive={class_is_positive} (class={predicted_class})"
+                    )
             else:
-                # Baseline retrieval is STRONG - AL can optimize ranking!
+                # Default mode: gate OFF if baseline is strong (primary signal)
+                if baseline_is_strong:
+                    feedback_gated = True
+                    gate_reason = (
+                        f"BASELINE STRONG: FAISS top-1={max_faiss_score:.4f} ≥ "
+                        f"ceiling={FEEDBACK_GATE_FAISS_CEILING:.2f} — AL would disrupt good ranking"
+                    )
+            
+            if feedback_gated:
+                feedback_logger.info(f"🚫 AL GATED OFF: {gate_reason}")
+            else:
                 feedback_logger.info(
-                    f"✅ CORRECTED GATE: Baseline retrieval is STRONG ({max_faiss_score:.4f} ≥ {STRONG_BASELINE_THRESHOLD:.2f}) - "
-                    f"Activating AL to optimize ranking (expected +1.5% improvement based on n=316 analysis)"
+                    f"✅ AL ACTIVATED: FAISS top-1={max_faiss_score:.4f} < "
+                    f"ceiling={FEEDBACK_GATE_FAISS_CEILING:.2f}, class={predicted_category} — "
+                    f"weak baseline, AL can rescue"
                 )
         
         # If gated, return baseline results immediately
@@ -1200,33 +1247,29 @@ class RAGSystem:
         return results[['retrieved_id', 'first_reply', 'Title_anon', 'Description_anon', 'enhanced_score', 'confidence_gated']]
 
     def _calculate_enhanced_score(self, query, candidate_row, predicted_category, faiss_score):
-        """Calculate enhanced score considering multiple factors
+        """Calculate enhanced score considering multiple factors.
         
-        REBALANCED weights to give feedback room to dominate:
-        - Base components use 65% total (down from 100%)
-        - Feedback lift (±1.5 max) can now significantly impact rankings
-        - Prevents base score variance from overwhelming feedback signal
+        FAISS similarity is the strongest signal and gets 50% weight.
+        Category match, title, and description get smaller weights.
+        Feedback lift (positive-only, capped at 0.15) is added on top
+        by the caller — intentionally small so FAISS ranking is respected.
         """
-        # Base FAISS similarity (40% weight) - Reduced from 50%
-        base_score = 0.4 * faiss_score
+        # Base FAISS similarity (50% weight) — strongest signal, trust it
+        base_score = 0.50 * faiss_score
         
-        # Category match bonus (12% weight) - Reduced from 20%
+        # Category match bonus (15% weight)
         category_bonus = 0.0
         if predicted_category and candidate_row.get('label_auto') == predicted_category:
-            category_bonus = 0.12
+            category_bonus = 0.15
         
-        # Title similarity (8% weight) - Reduced from 15%
+        # Title similarity (10% weight)
         title_sim = self._calculate_field_similarity(query, candidate_row.get('Title_anon', ''))
-        title_score = 0.08 * title_sim
+        title_score = 0.10 * title_sim
         
-        # Description similarity (5% weight) - Reduced from 10%
+        # Description similarity (5% weight)
         desc_sim = self._calculate_field_similarity(query, candidate_row.get('Description_anon', ''))
         desc_score = 0.05 * desc_sim
         
-        # Quality bonus removed (was 5%) - redundant with FAISS similarity
-        
-        # Total base score now ranges from ~0.4 to ~0.65 (35% room for feedback)
-        # Feedback lift (±1.5 capped) is ADDED to this, giving it proper influence
         return base_score + category_bonus + title_score + desc_score
 
     def _calculate_field_similarity(self, query, field_text):
