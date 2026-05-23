@@ -42,9 +42,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
+import platform
 import random
 import re
 import sys
@@ -74,6 +76,93 @@ def _sanitize_for_json(obj):
             return None
         return obj
     return obj
+
+
+def _sha256_file(path: str) -> Optional[str]:
+    """Return SHA256 hex for file content, or None if unavailable."""
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1024 * 1024)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _file_stats(path: Optional[str]) -> dict:
+    """Return basic file fingerprint stats for reproducibility checks."""
+    if not path:
+        return {"path": None, "exists": False, "size_bytes": None, "mtime": None, "sha256": None}
+    exists = os.path.exists(path)
+    if not exists:
+        return {"path": path, "exists": False, "size_bytes": None, "mtime": None, "sha256": None}
+    try:
+        size_bytes = os.path.getsize(path)
+        mtime = os.path.getmtime(path)
+    except Exception:
+        size_bytes = None
+        mtime = None
+    return {
+        "path": path,
+        "exists": True,
+        "size_bytes": size_bytes,
+        "mtime": mtime,
+        "sha256": _sha256_file(path),
+    }
+
+
+def _sqlite_feedback_stats(path: Optional[str]) -> dict:
+    """Return lightweight DB stats for feedback DB identity checks."""
+    if not path or not os.path.exists(path):
+        return {
+            "path": path,
+            "exists": False,
+            "feedback_agg_rows": None,
+            "votes_rows": None,
+            "distinct_retrieved_ids": None,
+        }
+
+    import sqlite3
+
+    out = {
+        "path": path,
+        "exists": True,
+        "feedback_agg_rows": None,
+        "votes_rows": None,
+        "distinct_retrieved_ids": None,
+    }
+    conn = None
+    try:
+        conn = sqlite3.connect(path)
+        cur = conn.cursor()
+        try:
+            out["feedback_agg_rows"] = cur.execute("SELECT COUNT(*) FROM feedback_agg").fetchone()[0]
+            out["distinct_retrieved_ids"] = cur.execute("SELECT COUNT(DISTINCT retrieved_id) FROM feedback_agg").fetchone()[0]
+        except Exception:
+            pass
+        try:
+            out["votes_rows"] = cur.execute("SELECT COUNT(*) FROM votes").fetchone()[0]
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return out
+
+
+def _stable_fingerprint_id(payload: dict) -> str:
+    """Stable ID for quick comparability checks between runs."""
+    encoded = json.dumps(_sanitize_for_json(payload), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 # ============================================================================
@@ -159,7 +248,7 @@ def _norm_class(x: str) -> str:
 # ============================================================================
 # FEEDBACK DB SEEDING — copy the production feedback_refid.db into eval workspace
 # ============================================================================
-PRODUCTION_FEEDBACK_DB = os.path.join(os.path.dirname(__file__) or ".", "feedback_refid.db")
+PRODUCTION_FEEDBACK_DB = os.path.join(os.path.dirname(__file__) or ".", "feedback_refid.db") # os.path.join(os.path.dirname(__file__) or ".", "feedback_global.db")
 
 
 def _seed_feedback_db(dest_path: str) -> int:
@@ -325,8 +414,9 @@ async def _self_teaching_al_pass(
     (generation + judge happen concurrently per ticket), but tickets
     are processed ONE AT A TIME so feedback accumulates.
     """
-    from resolution_task_async import async_generate_response, async_judge_items
-    from judge_service import map_scores_to_votes
+    from resolution_task_async import async_generate_response
+    # from resolution_task_async import async_judge_items
+    # from judge_service import map_scores_to_votes
 
     loop = asyncio.get_event_loop()
     results = []
@@ -344,6 +434,7 @@ async def _self_teaching_al_pass(
             )
 
             # Step 2: Judge the retrieved examples
+            # Judge API calls disabled to reduce LLM quota/cost burn.
             import pandas as pd
             similar_replies_list = result.get("similar_replies", [])
             if isinstance(similar_replies_list, pd.DataFrame):
@@ -352,35 +443,36 @@ async def _self_teaching_al_pass(
             expected_reply = ticket.get("expected_first_reply", "")
 
             if similar_replies_list and expected_reply:
-                try:
-                    judge_result = await async_judge_items(
-                        ticket["title"], ticket["description"],
-                        similar_replies_list, 5,
-                        expected_first_reply=expected_reply,
-                    )
-                    scores = judge_result.get("scores", [])
+                # try:
+                #     judge_result = await async_judge_items(
+                #         ticket["title"], ticket["description"],
+                #         similar_replies_list, 5,
+                #         expected_first_reply=expected_reply,
+                #     )
+                #     scores = judge_result.get("scores", [])
 
-                    # Step 3: Record feedback votes from judge
-                    votes = map_scores_to_votes(scores)
-                    predicted_class = result.get("predicted_class", result.get("classification"))
-                    predicted_team = result.get("predicted_team")
+                #     # Step 3: Record feedback votes from judge
+                #     votes = map_scores_to_votes(scores)
+                #     predicted_class = result.get("predicted_class", result.get("classification"))
+                #     predicted_team = result.get("predicted_team")
 
-                    for vote in votes:
-                        label = int(vote.get("label", 0))
-                        # Record both positive and negative votes
-                        rt_al.record_feedback(
-                            query_id=f"eval_ticket_{i}",
-                            retrieved_id=str(vote["retrieved_id"]),
-                            label=label,
-                            predicted_class=predicted_class,
-                            predicted_team=predicted_team,
-                        )
-                        if label != 0:
-                            feedback_recorded += 1
+                #     for vote in votes:
+                #         label = int(vote.get("label", 0))
+                #         # Record both positive and negative votes
+                #         rt_al.record_feedback(
+                #             query_id=f"eval_ticket_{i}",
+                #             retrieved_id=str(vote["retrieved_id"]),
+                #             label=label,
+                #             predicted_class=predicted_class,
+                #             predicted_team=predicted_team,
+                #         )
+                #         if label != 0:
+                #             feedback_recorded += 1
 
-                except Exception as e:
-                    if i <= 5:
-                        print(f"{eval_tag} [AL-TEACH] ⚠️ Judge/feedback error ticket {i}: {e}")
+                # except Exception as e:
+                #     if i <= 5:
+                #         print(f"{eval_tag} [AL-TEACH] ⚠️ Judge/feedback error ticket {i}: {e}")
+                pass
 
             results.append(result)
 
@@ -422,7 +514,7 @@ async def _postprocess_ticket_async(
 
         import pandas as pd
         from sentence_transformers import util as st_util
-        from resolution_task_async import async_judge_items, async_llm_compare
+        # from resolution_task_async import async_judge_items, async_llm_compare
 
         expected_reply = ticket.get("expected_first_reply", "")
 
@@ -471,31 +563,31 @@ async def _postprocess_ticket_async(
         if isinstance(similar_replies_list_al, pd.DataFrame):
             similar_replies_list_al = similar_replies_list_al.to_dict(orient="records")
 
-        async def _noop_judge():
-            return {"scores": []}
+        # async def _noop_judge():
+        #     return {"scores": []}
 
-        async def _noop_compare():
-            return None
+        # async def _noop_compare():
+        #     return None
 
-        judge_base_coro = (
-            async_judge_items(
-                ticket["title"], ticket["description"],
-                similar_replies_list_base, 5,
-                expected_first_reply=expected_reply,
-            )
-            if similar_replies_list_base
-            else _noop_judge()
-        )
+        # judge_base_coro = (
+        #     async_judge_items(
+        #         ticket["title"], ticket["description"],
+        #         similar_replies_list_base, 5,
+        #         expected_first_reply=expected_reply,
+        #     )
+        #     if similar_replies_list_base
+        #     else _noop_judge()
+        # )
 
-        judge_al_coro = (
-            async_judge_items(
-                ticket["title"], ticket["description"],
-                similar_replies_list_al, 5,
-                expected_first_reply=expected_reply,
-            )
-            if similar_replies_list_al
-            else _noop_judge()
-        )
+        # judge_al_coro = (
+        #     async_judge_items(
+        #         ticket["title"], ticket["description"],
+        #         similar_replies_list_al, 5,
+        #         expected_first_reply=expected_reply,
+        #     )
+        #     if similar_replies_list_al
+        #     else _noop_judge()
+        # )
 
         # LLM compare commented out to save API calls
         # llm_compare_coro = (
@@ -509,13 +601,15 @@ async def _postprocess_ticket_async(
         llm_comp = None
 
         # Fire judges concurrently (LLM compare disabled)
-        try:
-            jr_base, jr_al = await asyncio.gather(
-                judge_base_coro, judge_al_coro,
-                return_exceptions=True,
-            )
-        except Exception:
-            jr_base, jr_al = {"scores": []}, {"scores": []}
+        # Judge API calls disabled to reduce LLM quota/cost burn.
+        # try:
+        #     jr_base, jr_al = await asyncio.gather(
+        #         judge_base_coro, judge_al_coro,
+        #         return_exceptions=True,
+        #     )
+        # except Exception:
+        #     jr_base, jr_al = {"scores": []}, {"scores": []}
+        jr_base, jr_al = {"scores": []}, {"scores": []}
 
         # Handle exceptions from gather
         if isinstance(jr_base, Exception):
@@ -581,6 +675,8 @@ async def _postprocess_ticket_async(
             "predicted_class_base": predicted_class_base,
             "generated_response_al": generated_response_al,
             "generated_response_base": generated_response_base,
+            "similar_replies_al": result_al.get("similar_replies", []),
+            "similar_replies_base": result_base.get("similar_replies", []),
             "team_match_al": quality_al["team_match"],
             "team_match_base": quality_base["team_match"],
             "class_match_al": class_match,
@@ -613,8 +709,9 @@ def run_single_evaluation_async(
     num_test_tickets: int,
     original_kb_path: str,
     results_dir: str,
-    disable_gating: bool = True,
+    disable_gating: bool = False,#True,
     concurrent_tickets: int = 5,
+    sentence_model_name: str = "all-MiniLM-L6-v2",
 ) -> dict:
     """Run one complete evaluation in an isolated process, with async ticket processing.
 
@@ -674,6 +771,11 @@ def run_single_evaluation_async(
     except ImportError:
         pass
 
+    if _rouge_scorer_mod is None:
+        print(f"{eval_tag} WARNING: `rouge_score` is not installed. ROUGE-L metrics will be missing.")
+    if _bert_score_fn is None:
+        print(f"{eval_tag} WARNING: `bert_score` is not installed. BERTScore metrics will be missing.")
+
     print(f"\n{'=' * 80}")
     print(f"{eval_tag} STARTING (seed={seed}, tickets={num_test_tickets}, concurrent={concurrent_tickets})")
     print(f"{'=' * 80}")
@@ -686,7 +788,18 @@ def run_single_evaluation_async(
     df = df.dropna(subset=["first_reply"])
     print(f"{eval_tag} Dataset: {len(df)} tickets with valid first replies")
 
-    test_sample = df.sample(num_test_tickets, random_state=seed)
+    # PAPER RESCUE (2026-05-09): Support targeted evaluation on specific Refs
+    paper_refs_file = os.getenv("PAPER_EVAL_REFS_FILE")
+    if paper_refs_file and os.path.exists(paper_refs_file):
+        with open(paper_refs_file, "r") as f:
+            target_refs = [line.strip() for line in f if line.strip()]
+        print(f"{eval_tag} 🎯 TARGETED EVAL: Loading {len(target_refs)} specific tickets from {paper_refs_file}")
+        test_sample = df[df['Ref'].astype(str).isin(target_refs)]
+        # Re-sort to match the file order if desired, or just take them as they are
+        print(f"{eval_tag} Successfully matched {len(test_sample)} out of {len(target_refs)} requested Refs")
+    else:
+        test_sample = df.sample(num_test_tickets, random_state=seed)
+
     test_tickets = []
     test_indices = []
     for idx, row in test_sample.iterrows():
@@ -707,6 +820,8 @@ def run_single_evaluation_async(
 
     # ---- Step 3: Build RAG system ----
     os.environ["DISABLE_EMBEDDING_CACHE"] = "1"
+    # Ensure all components in this worker process see the same embedding model.
+    os.environ["SENTENCE_MODEL"] = sentence_model_name
     if disable_gating:
         os.environ["FEEDBACK_CONFIDENCE_GATE"] = "false"
         os.environ["AL_TIER_ENABLED"] = "false"
@@ -769,7 +884,7 @@ def run_single_evaluation_async(
         rt_al.AL_TIER_ENABLED = False
 
     al_df = rt_al.load_knowledge_base(kb_copy_path)
-    al_rag = rt_al.RAGSystem(al_df, kb_path=kb_copy_path)
+    al_rag = rt_al.RAGSystem(al_df, sentence_model_name=sentence_model_name, kb_path=kb_copy_path)
     build_start = time.time()
     al_rag.build_index(kb_path=kb_copy_path, kb_mtime=os.path.getmtime(kb_copy_path))
     al_build_time = time.time() - build_start
@@ -923,6 +1038,81 @@ def run_single_evaluation_async(
     results = raw_results
     print(f"{eval_tag} Completed: {len(results)}/{num_test_tickets} tickets")
 
+    # ---- Reproducibility fingerprint ----
+    env_keys = [
+        "OPENAI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "OPENROUTER_BASE_URL",
+        "OPENROUTER_APP_NAME",
+        "OPENROUTER_HTTP_REFERER",
+        "OPENROUTER_STRICT_CONSISTENCY",
+        "OPENROUTER_REQUIRE_PINNED_MODEL",
+        "OPENROUTER_ALLOW_FALLBACKS",
+        "OPENROUTER_PROVIDER",
+        "OPENROUTER_ENABLE_CACHE",
+        "OPENROUTER_CACHE_DB_PATH",
+        "PREBUILT_FEEDBACK_DB_PATH",
+        "FEEDBACK_DB_PATH",
+        "FEEDBACK_ENABLED",
+        "FEEDBACK_CONFIDENCE_GATE",
+        "FEEDBACK_GATE_FAISS_CEILING",
+        "FEEDBACK_GATE_CLASS_AWARE",
+        "FEEDBACK_GATE_CLASS_CEILINGS",
+        "FEEDBACK_GATE_CLASS_MIN_SAMPLES",
+        "FEEDBACK_GATE_CLASS_Z_MIN",
+        "FEEDBACK_FUZZY_GATING",
+        "FEEDBACK_FUZZY_LOW",
+        "FEEDBACK_FUZZY_HIGH",
+        "LLM_TEMPERATURE",
+        "LLM_MODEL",
+    ]
+    env_snapshot = {}
+    for k in env_keys:
+        v = os.getenv(k)
+        if "KEY" in k and v:
+            env_snapshot[k] = "set"
+        else:
+            env_snapshot[k] = v
+
+    rt_snapshot = {
+        "LLM_MODEL": getattr(rt_al, "LLM_MODEL", None),
+        "LLM_TEMPERATURE": getattr(rt_al, "LLM_TEMPERATURE", None),
+        "FEEDBACK_ENABLED": getattr(rt_al, "FEEDBACK_ENABLED", None),
+        "FEEDBACK_CONFIDENCE_GATE": getattr(rt_al, "FEEDBACK_CONFIDENCE_GATE", None),
+        "FEEDBACK_GATE_FAISS_CEILING": getattr(rt_al, "FEEDBACK_GATE_FAISS_CEILING", None),
+        "FEEDBACK_GATE_CLASS_AWARE": getattr(rt_al, "FEEDBACK_GATE_CLASS_AWARE", None),
+        "FEEDBACK_GATE_CLASS_MIN_SAMPLES": getattr(rt_al, "FEEDBACK_GATE_CLASS_MIN_SAMPLES", None),
+        "FEEDBACK_GATE_CLASS_Z_MIN": getattr(rt_al, "FEEDBACK_GATE_CLASS_Z_MIN", None),
+        "FEEDBACK_FUZZY_GATING": getattr(rt_al, "FEEDBACK_FUZZY_GATING", None),
+        "FEEDBACK_FUZZY_LOW": getattr(rt_al, "FEEDBACK_FUZZY_LOW", None),
+        "FEEDBACK_FUZZY_HIGH": getattr(rt_al, "FEEDBACK_FUZZY_HIGH", None),
+        "FEEDBACK_POSITIVE_ONLY": getattr(rt_al, "FEEDBACK_POSITIVE_ONLY", None),
+    }
+
+    prebuilt_path = os.getenv("PREBUILT_FEEDBACK_DB_PATH", "feedback_global.db")
+    fingerprint_core = {
+        "python": sys.version,
+        "platform": platform.platform(),
+        "cwd": os.getcwd(),
+        "script": __file__,
+        "seed": seed,
+        "eval_id": eval_id,
+        "num_test_tickets": num_test_tickets,
+        "concurrent_tickets": concurrent_tickets,
+        "sentence_model_name": sentence_model_name,
+        "embedding_dim": int(al_rag.embeddings.shape[1]) if getattr(al_rag, "embeddings", None) is not None else None,
+        "disable_gating_arg": disable_gating,
+        "kb_original": _file_stats(original_kb_path),
+        "kb_eval_copy": _file_stats(kb_copy_path),
+        "feedback_db_eval": _file_stats(feedback_db_path),
+        "feedback_db_eval_stats": _sqlite_feedback_stats(feedback_db_path),
+        "feedback_db_prebuilt": _file_stats(prebuilt_path),
+        "seeded_feedback_rows": seeded_rows,
+        "env": env_snapshot,
+        "rt_config": rt_snapshot,
+    }
+    fingerprint_id = _stable_fingerprint_id(fingerprint_core)
+
     # ---- OPTIMIZATION 5: Batch BERTScore ----
     if _bert_score_fn is not None and results:
         print(f"{eval_tag} Computing BERTScore in batch ({len(results) * 2} pairs)...")
@@ -1031,8 +1221,12 @@ def run_single_evaluation_async(
         "total_time_s": total_time,
         "avg_time_per_ticket_s": total_time / len(results) if results else 0.0,
         "embedding_build_time_s": al_build_time,
+        "sentence_model_name": sentence_model_name,
+        "embedding_dim": int(al_rag.embeddings.shape[1]) if getattr(al_rag, "embeddings", None) is not None else None,
         "knowledge_base": kb_copy_path,
         "knowledge_base_size": len(df_kb),
+        "run_fingerprint_id": fingerprint_id,
+        "run_fingerprint": fingerprint_core,
     }
 
     # ---- Step 7: Save results ----
@@ -1068,6 +1262,7 @@ def run_single_evaluation_async(
     print(f"{eval_tag} Judge:  {avg_judge:.4f}")
     # print(f"{eval_tag} LLM Compare: AL-better={better_al} Base-better={better_base} Ties={ties}")
     print(f"{eval_tag} Saved: {results_file}")
+    print(f"{eval_tag} Fingerprint: {fingerprint_id}")
     print(f"{'=' * 80}\n")
 
     return safe_summary
@@ -1082,6 +1277,8 @@ def run_multiple_evaluations_async(
     max_parallel: int = 2,
     base_seed: Optional[int] = None,
     concurrent_tickets: int = 5,
+    disable_gating: bool = False,
+    sentence_model_name: str = "all-MiniLM-L6-v2",
 ):
     """Launch multiple independent evaluations in parallel using separate processes.
 
@@ -1094,7 +1291,8 @@ def run_multiple_evaluations_async(
     print(f"   Tickets per eval:     {tickets_per_eval}")
     print(f"   Max parallel evals:   {max_parallel}")
     print(f"   Concurrent tickets:   {concurrent_tickets}")
-    print(f"   Gating:               DISABLED")
+    print(f"   Sentence model:       {sentence_model_name}")
+    print(f"   Gating disabled:      {disable_gating}")
     print(f"   Results dir:          {RESULTS_DIR}")
     print()
 
@@ -1134,8 +1332,9 @@ def run_multiple_evaluations_async(
                 num_test_tickets=tickets_per_eval,
                 original_kb_path=ORIGINAL_KB_PATH,
                 results_dir=results_dir_str,
-                disable_gating=False,  # Enable evidence-based gating (2026-02-17)
+                disable_gating=disable_gating,
                 concurrent_tickets=concurrent_tickets,
+                sentence_model_name=sentence_model_name,
             )
             futures[future] = eval_id
             print(f"📤 Submitted Eval-{eval_id} (seed={seeds[eval_id - 1]})")
@@ -1250,8 +1449,9 @@ def run_multiple_evaluations_async(
             "num_failed": len(failed_evals),
             "tickets_per_eval": tickets_per_eval,
             "concurrent_tickets": concurrent_tickets,
+            "sentence_model_name": sentence_model_name,
             "seeds": seeds,
-            "gating_disabled": True,
+            "gating_disabled": disable_gating,
             "total_time_s": overall_time,
             "cosine_al_mean": _mean(cos_al_vals),
             "cosine_al_std": _std(cos_al_vals),
@@ -1265,6 +1465,8 @@ def run_multiple_evaluations_async(
             "llm_total_al_better": total_al_better,
             "llm_total_base_better": total_base_better,
             "llm_total_ties": total_ties,
+            "run_fingerprint_ids": [s.get("run_fingerprint_id") for s in all_summaries],
+            "run_fingerprints": [s.get("run_fingerprint") for s in all_summaries],
             "individual_summaries": all_summaries,
         }
         with open(agg_file, "w") as f:
@@ -1291,6 +1493,8 @@ if __name__ == "__main__":
     parser.add_argument("--max-parallel", type=int, default=2, help="Max concurrent evaluation processes (default: 2)")
     parser.add_argument("--concurrent-tickets", type=int, default=5, help="Concurrent tickets per evaluation (default: 5). Controls how many OpenAI requests are in-flight simultaneously.")
     parser.add_argument("--base-seed", type=int, default=None, help="Base seed for reproducibility. Eval i gets seed base_seed+i.")
+    parser.add_argument("--disable-gating", action="store_true", help="Disable gating logic during evaluation (forces FEEDBACK_CONFIDENCE_GATE=false and AL_TIER_ENABLED=false inside workers).")
+    parser.add_argument("--sentence-model", type=str, default="all-MiniLM-L6-v2", help="SentenceTransformer model for retrieval/indexing (default: all-MiniLM-L6-v2).")
 
     args = parser.parse_args()
 
@@ -1298,6 +1502,8 @@ if __name__ == "__main__":
     print(f"   Python:           {sys.version.split()[0]}")
     print(f"   CWD:              {os.getcwd()}")
     print(f"   OpenAI:           {'✅ key set' if os.getenv('OPENAI_API_KEY') else '❌ not set'}")
+    print(f"   Disable gating:   {args.disable_gating}")
+    print(f"   Sentence model:   {args.sentence_model}")
     print(f"   Async speedups:   ✅ Enabled")
     print()
 
@@ -1307,4 +1513,6 @@ if __name__ == "__main__":
         max_parallel=args.max_parallel,
         base_seed=args.base_seed,
         concurrent_tickets=args.concurrent_tickets,
+        disable_gating=args.disable_gating,
+        sentence_model_name=args.sentence_model,
     )

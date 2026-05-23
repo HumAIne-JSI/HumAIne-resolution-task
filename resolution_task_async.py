@@ -23,13 +23,98 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+# Strict consistency controls for OpenRouter eval stability.
+# - Enforce pinned model IDs (avoid moving aliases like "gpt-4").
+# - Optionally constrain provider routing.
+# - Cache completion output by (model + prompt + kwargs) for repeatability.
+OPENROUTER_STRICT_CONSISTENCY = _env_bool("OPENROUTER_STRICT_CONSISTENCY", False)
+OPENROUTER_REQUIRE_PINNED_MODEL = _env_bool("OPENROUTER_REQUIRE_PINNED_MODEL", True)
+OPENROUTER_ALLOW_FALLBACKS = _env_bool("OPENROUTER_ALLOW_FALLBACKS", False)
+OPENROUTER_PROVIDER = os.getenv("OPENROUTER_PROVIDER", "").strip()
+OPENROUTER_ENABLE_CACHE = _env_bool("OPENROUTER_ENABLE_CACHE", True)
+OPENROUTER_CACHE_DB_PATH = os.getenv("OPENROUTER_CACHE_DB_PATH", "openrouter_consistency_cache.db")
+
+# Known moving aliases that are unsuitable for strict eval reproducibility.
+_MODEL_ALIASES = {
+    "gpt-4",
+    "gpt-4o",
+    "gpt-3.5-turbo",
+    "openai/gpt-4",
+    "openai/gpt-4o",
+    "openai/gpt-3.5-turbo",
+}
+
+
+def _init_cache_db(path: str) -> None:
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS completion_cache (
+                cache_key TEXT PRIMARY KEY,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _cache_key(model: str, messages: list, kwargs: dict) -> str:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "kwargs": kwargs,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _cache_get(path: str, key: str) -> Optional[str]:
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        row = conn.execute("SELECT content FROM completion_cache WHERE cache_key=?", (key,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _cache_put(path: str, key: str, content: str) -> None:
+    conn = sqlite3.connect(path, timeout=30)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO completion_cache(cache_key, content, created_at) VALUES (?, ?, ?)",
+            (key, content, time.time()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _is_alias_model(model: str) -> bool:
+    m = (model or "").strip().lower()
+    return m in _MODEL_ALIASES
 
 # ============================================================================
 # ASYNC OPENAI CLIENT
@@ -40,11 +125,26 @@ _async_client_mode = "unavailable"
 try:
     from openai import AsyncOpenAI
 
-    _api_key = os.getenv("OPENAI_API_KEY")
+    _api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY")
+    _base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    _use_openrouter = bool(os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENROUTER_BASE_URL"))
+    _http_referer = os.getenv("OPENROUTER_HTTP_REFERER")
+    _app_name = os.getenv("OPENROUTER_APP_NAME")
+
+    client_kwargs = {}
     if _api_key:
-        _async_openai_client = AsyncOpenAI(api_key=_api_key)
-    else:
-        _async_openai_client = AsyncOpenAI()
+        client_kwargs["api_key"] = _api_key
+    if _use_openrouter:
+        client_kwargs["base_url"] = _base_url
+        or_headers = {}
+        if _http_referer:
+            or_headers["HTTP-Referer"] = _http_referer
+        if _app_name:
+            or_headers["X-Title"] = _app_name
+        if or_headers:
+            client_kwargs["default_headers"] = or_headers
+
+    _async_openai_client = AsyncOpenAI(**client_kwargs) if client_kwargs else AsyncOpenAI()
     _async_client_mode = "async_v1"
     logger.info("AsyncOpenAI client initialized")
 except ImportError:
@@ -57,10 +157,54 @@ async def _async_chat_completion(model: str, messages: list, **kwargs) -> str:
     """Async version of resolution_task._chat_completion."""
     if _async_openai_client is None:
         return "[AsyncOpenAI client unavailable]"
-    resp = await _async_openai_client.chat.completions.create(
-        model=model, messages=messages, **kwargs
-    )
-    return resp.choices[0].message.content.strip()
+
+    req_kwargs = dict(kwargs)
+
+    # Strict mode: reduce OpenRouter route drift and disallow floating model aliases.
+    if OPENROUTER_STRICT_CONSISTENCY:
+        if OPENROUTER_REQUIRE_PINNED_MODEL and _is_alias_model(model):
+            raise RuntimeError(
+                f"Strict consistency requires pinned model ID, got alias '{model}'. "
+                "Set GEN_MODEL_* and JUDGE_MODEL to pinned IDs."
+            )
+
+        if _use_openrouter:
+            provider_cfg = {
+                "allow_fallbacks": OPENROUTER_ALLOW_FALLBACKS,
+            }
+            if OPENROUTER_PROVIDER:
+                provider_cfg["order"] = [OPENROUTER_PROVIDER]
+
+            extra_body = dict(req_kwargs.get("extra_body", {}))
+            extra_body["provider"] = provider_cfg
+            req_kwargs["extra_body"] = extra_body
+
+    # Optional response cache to force repeatability across reruns with identical prompts.
+    use_cache = OPENROUTER_ENABLE_CACHE and OPENROUTER_STRICT_CONSISTENCY
+    cache_path = OPENROUTER_CACHE_DB_PATH
+    cache_hit = None
+    cache_key = None
+    if use_cache:
+        try:
+            _init_cache_db(cache_path)
+            cache_key = _cache_key(model, messages, req_kwargs)
+            cache_hit = _cache_get(cache_path, cache_key)
+        except Exception:
+            cache_hit = None
+
+    if cache_hit is not None:
+        return cache_hit
+
+    resp = await _async_openai_client.chat.completions.create(model=model, messages=messages, **req_kwargs)
+    content = resp.choices[0].message.content.strip()
+
+    if use_cache and cache_key:
+        try:
+            _cache_put(cache_path, cache_key, content)
+        except Exception:
+            pass
+
+    return content
 
 
 # ============================================================================
